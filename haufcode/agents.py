@@ -44,19 +44,34 @@ class AgentClient:
         """
         full_prompt = f"{system}\n\n{prompt}" if system else prompt
 
-        result = subprocess.run(
+        import signal as _signal
+        proc = subprocess.Popen(
             ["claude", "--print"],
-            input=full_prompt,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=1800,  # 30 min max par appel (init Architecte peut être très long)
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Claude Code CLI erreur (code {result.returncode}) : "
-                f"{result.stderr.strip()}"
+        try:
+            stdout, stderr = proc.communicate(
+                input=full_prompt,
+                timeout=1800,  # 30 min max par appel
             )
-        return result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            # Tuer proprement le processus et ses enfants
+            try:
+                os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+            except Exception:
+                proc.kill()
+            proc.wait()
+            raise RuntimeError("Claude Code CLI timeout après 30 minutes")
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Claude Code CLI erreur (code {proc.returncode}) : "
+                f"{stderr.strip()}"
+            )
+        return stdout.strip()
 
     # ── OpenAI-compatible (OpenRouter, Anthropic, OpenAI, Ollama, Autre) ──────
     def _call_openai_compat(self, prompt: str, system: str,
