@@ -3,12 +3,11 @@
 HaufCode — __main__.py
 Point d'entrée CLI : routing des sous-commandes.
 """
-import sys
 import argparse
+import sys
 
 from haufcode import __version__
 from haufcode.config import GlobalConfig
-
 
 # ── textes d'aide ─────────────────────────────────────────────────────────────
 HELP_TEXT = f"""

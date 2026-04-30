@@ -3,9 +3,9 @@ HaufCode — onboarding.py
 Procédure d'onboarding : lien symbolique + configuration Telegram.
 Déclenchée au premier lancement ou via `haufcode init`.
 """
+import getpass
 import os
 import sys
-import getpass
 from pathlib import Path
 
 from haufcode.config import GlobalConfig

@@ -9,7 +9,6 @@ from pathlib import Path
 
 from haufcode.config import METRICS_FILE
 
-
 FIELDNAMES = ["Timestamp", "Phase", "Sprint", "Role", "Agent", "Slice", "Duree_s", "Statut"]
 
 

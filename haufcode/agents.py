@@ -4,11 +4,11 @@ Couche d'abstraction pour appeler les agents IA.
 Supporte : OpenRouter, Anthropic API, OpenAI, Ollama, Claude Code CLI, Autre.
 """
 import json
-import subprocess
-import urllib.request
-import urllib.error
-import tempfile
 import os
+import subprocess
+import tempfile
+import urllib.error
+import urllib.request
 from typing import Optional
 
 
@@ -106,7 +106,7 @@ class AgentClient:
         # Extraction de la réponse
         try:
             return result["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError) as e:
+        except (KeyError, IndexError):
             raise RuntimeError(f"Réponse inattendue de {self.provider} : {result}")
 
     def _resolve_base_url(self) -> str:

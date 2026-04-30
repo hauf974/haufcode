@@ -4,16 +4,19 @@ Gestion du démon principal : start, stop, resume, status, logs, changeagents.
 Gestion du PID, du verrou global, et de la reprise sur état sauvegardé.
 """
 import os
-import sys
 import signal
-import time
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 from haufcode.config import (
-    GlobalConfig, ProjectConfig, ProjectState,
-    PROJECT_PID_FILE, PROJECT_CONFIG_DIR,
     GLOBAL_LOCK_FILE,
+    PROJECT_CONFIG_DIR,
+    PROJECT_PID_FILE,
+    GlobalConfig,
+    ProjectConfig,
+    ProjectState,
 )
 
 
@@ -41,7 +44,7 @@ def cmd_start(projet_md: str):
         cfg.projet_md = projet_path.name
         run_project_setup(cfg)
     else:
-        print(f"✅  Configuration projet existante chargée.")
+        print("✅  Configuration projet existante chargée.")
 
     state = ProjectState(project_dir)
 
@@ -74,7 +77,7 @@ def _fork_daemon(project_dir: str, projet_md_name: str):
                 print(f"✅  Usine démarrée (PID {actual_pid})")
                 break
         else:
-            print(f"✅  Usine démarrée.")
+            print("✅  Usine démarrée.")
 
         # Créer le verrou global
         GLOBAL_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -116,10 +119,10 @@ def _fork_daemon(project_dir: str, projet_md_name: str):
 
 def _run_factory(project_dir: str, projet_md_name: str):
     """Corps du démon : instancie et lance le Runner."""
-    from haufcode.runner import Runner
-    from haufcode.config import ProjectConfig, ProjectState
     import haufcode.git_ops as git_ops
     import haufcode.logger as hlog
+    from haufcode.config import ProjectConfig, ProjectState
+    from haufcode.runner import Runner
 
     cfg = ProjectConfig(project_dir)
     state = ProjectState(project_dir)
@@ -198,8 +201,8 @@ def cmd_resume():
 # ── status ────────────────────────────────────────────────────────────────────
 def cmd_status():
     """Affiche le statut courant de l'usine et la progression du projet."""
-    from haufcode.planning import TodoFile
     from haufcode.metrics import get_summary
+    from haufcode.planning import TodoFile
 
     project_dir = _get_last_project_dir()
     if not project_dir:
@@ -237,7 +240,7 @@ def cmd_status():
     todo = TodoFile(project_dir)
     counts = todo.count_by_status()
     if counts:
-        total = sum(counts.values())
+        sum(counts.values())
         print("  Progression des slices :")
         for status, count in counts.items():
             bar = "█" * count
@@ -247,7 +250,7 @@ def cmd_status():
     # Métriques
     summary = get_summary()
     if summary:
-        print(f"  Métriques cumulées :")
+        print("  Métriques cumulées :")
         print(f"    Total       : {summary.get('total', 0)}")
         print(f"    PASS        : {summary.get('PASS', 0)}")
         print(f"    FAIL        : {summary.get('FAIL', 0)}")

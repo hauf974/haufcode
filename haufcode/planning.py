@@ -9,8 +9,8 @@ Le format est défini par l'Architecte mais cette classe fournit les primitives
 pour extraire les verdicts et mettre à jour les statuts.
 """
 import re
-from pathlib import Path
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 

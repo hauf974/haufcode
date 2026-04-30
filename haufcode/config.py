@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 from typing import Optional
 
-
 # ── chemins ───────────────────────────────────────────────────────────────────
 GLOBAL_CONFIG_DIR = Path.home() / ".haufcode"
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.json"

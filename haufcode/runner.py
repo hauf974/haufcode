@@ -3,23 +3,26 @@ HaufCode — runner.py
 Boucle principale de l'usine : Architecte → Builder → Tester.
 Gère les verdicts PASS / FAIL / BLOCKED, les itérations, les revues de sprint/phase.
 """
-import time
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
-from haufcode.config import ProjectConfig, ProjectState
-from haufcode.agents import get_agent, AgentClient
-from haufcode.planning import PhaseFile, TodoFile, write_architect_output, Slice
-from haufcode.prompts import (
-    ARCHITECT_SYSTEM, BUILDER_SYSTEM, TESTER_SYSTEM,
-    ARCHITECT_INIT_PROMPT, SPRINT_REVIEW_PROMPT, PHASE_REVIEW_PROMPT,
-)
-from haufcode.metrics import record as record_metric
-from haufcode import logger as hlog
-from haufcode.telegram_client import TelegramClient
-from haufcode.config import GlobalConfig
 import haufcode.git_ops as git_ops
+from haufcode import logger as hlog
+from haufcode.agents import AgentClient, get_agent
+from haufcode.config import GlobalConfig, ProjectConfig, ProjectState
+from haufcode.metrics import record as record_metric
+from haufcode.planning import PhaseFile, Slice, TodoFile, write_architect_output
+from haufcode.prompts import (
+    ARCHITECT_INIT_PROMPT,
+    ARCHITECT_SYSTEM,
+    BUILDER_SYSTEM,
+    PHASE_REVIEW_PROMPT,
+    SPRINT_REVIEW_PROMPT,
+    TESTER_SYSTEM,
+)
+from haufcode.telegram_client import TelegramClient
 
 MAX_ITERATIONS = 5  # Itérations Builder→Tester avant escalade à l'Architecte
 
@@ -221,7 +224,7 @@ class Runner:
                 self.state.save()
 
                 builder_prompt = self._build_builder_prompt(sl, tester_notes, iterations)
-                builder_response = self._call_agent("BUILDER", builder_prompt, BUILDER_SYSTEM)
+                self._call_agent("BUILDER", builder_prompt, BUILDER_SYSTEM)
                 duration_builder = time.time() - t0
 
                 record_metric(

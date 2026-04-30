@@ -2,10 +2,10 @@
 HaufCode — git_ops.py
 Opérations Git et GitHub : commit automatique après PASS, push vers le dépôt distant.
 """
-import subprocess
-import urllib.request
-import urllib.error
 import json
+import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from haufcode.logger import get_logger

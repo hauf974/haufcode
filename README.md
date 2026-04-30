@@ -1,6 +1,6 @@
 # HaufCode
 
-[![CI](https://github.com/hauf974/haufcode/actions/workflows/ci.yml/badge.svg)](https://github.com/hauf974/haufcode/actions/workflows/ci.yml)
+[![CI](https://github.com/VOTRE_USER/haufcode/actions/workflows/ci.yml/badge.svg)](https://github.com/VOTRE_USER/haufcode/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Licence MIT](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 [![Aucune dépendance](https://img.shields.io/badge/dépendances-aucune-brightgreen.svg)]()
@@ -8,8 +8,6 @@
 **Orchestrateur de développement logiciel automatisé par agents IA.**
 
 HaufCode transforme un cahier des charges (`PROJET.md`) en un dépôt GitHub fonctionnel, testé et documenté, en orchestrant trois agents IA spécialisés selon un pipeline strict — sans intervention humaine continue.
-
-** PROJET.md est un cahier de spécifications qui doit être le plus complet possible **
 
 ---
 
@@ -93,7 +91,7 @@ PROJET.md
 
 ```bash
 # Cloner le dépôt
-git clone https://github.com/hauf974/haufcode.git
+git clone https://github.com/VOTRE_USER/haufcode.git
 cd haufcode
 
 # Aucun pip install requis — lancer directement

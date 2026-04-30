@@ -4,8 +4,8 @@ Client HTTP léger pour l'API Telegram Bot.
 Utilisé par l'onboarding et le runner pour envoyer des notifications.
 """
 import json
-import urllib.request
 import urllib.error
+import urllib.request
 from typing import Optional
 
 

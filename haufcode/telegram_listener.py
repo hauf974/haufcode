@@ -4,21 +4,22 @@ Listener Telegram — processus séparé, long-polling permanent.
 Survit au stop du démon principal.
 Gère les réponses humaines pour débloquer l'usine.
 """
-import os
-import sys
 import json
-import signal
-import time
 import logging
+import os
+import signal
+import sys
+import time
 from pathlib import Path
 
 from haufcode.config import (
-    GlobalConfig, ProjectState,
-    GLOBAL_CONFIG_DIR, GLOBAL_PID_FILE,
+    GLOBAL_CONFIG_DIR,
+    GLOBAL_PID_FILE,
     PROJECT_TELEGRAM_PID_FILE,
+    GlobalConfig,
+    ProjectState,
 )
 from haufcode.telegram_client import TelegramClient
-
 
 logger = logging.getLogger("haufcode.telegram_listener")
 
@@ -161,8 +162,8 @@ def _handle_update(client: TelegramClient, update: dict):
 
 def _cmd_resume(client: TelegramClient):
     """Relance le démon principal via haufcode resume."""
-    import subprocess
     import shutil
+    import subprocess
 
     haufcode_bin = shutil.which("haufcode") or sys.argv[0]
     try:
@@ -198,8 +199,8 @@ def _cmd_status(client: TelegramClient):
 
 def _cmd_stop(client: TelegramClient):
     """Demande un arrêt propre du démon."""
-    import subprocess
     import shutil
+    import subprocess
 
     haufcode_bin = shutil.which("haufcode") or sys.argv[0]
     try:

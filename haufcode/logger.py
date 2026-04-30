@@ -3,13 +3,12 @@ HaufCode — logger.py
 Logging textuel par session dans logs/<timestamp>_session.log
 Accessible en temps réel via `haufcode logs`.
 """
-import logging
 import datetime
+import logging
 import sys
 from pathlib import Path
 
 from haufcode.config import LOGS_DIR
-
 
 _session_logger: logging.Logger | None = None
 _log_file_path: Path | None = None

@@ -5,12 +5,11 @@ Configuration d'un projet au premier `haufcode start` :
   - Configuration GitHub optionnelle (PAT + test)
 """
 import getpass
-import sys
-from typing import Optional
-
-import urllib.request
-import urllib.error
 import json
+import sys
+import urllib.error
+import urllib.request
+from typing import Optional
 
 from haufcode.config import ProjectConfig
 

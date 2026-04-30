@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "haufcode"
-version = "0.1.0"
+version = "0.4.0"
 description = "Orchestrateur de développement logiciel automatisé par agents IA"
 readme = "README.md"
 license = { text = "MIT" }
@@ -30,9 +30,9 @@ dependencies = []
 haufcode = "haufcode.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/hauf974/haufcode"
-Repository = "https://github.com/hauf974/haufcode"
-Issues = "https://github.com/hauf974/haufcode/issues"
+Homepage = "https://github.com/VOTRE_USER/haufcode"
+Repository = "https://github.com/VOTRE_USER/haufcode"
+Issues = "https://github.com/VOTRE_USER/haufcode/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
