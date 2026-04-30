@@ -116,7 +116,8 @@ def _configure_agent(cfg: ProjectConfig, role: str):
 
     elif provider_key == "claude_code_cli":
         _check_claude_code_cli()
-        cfg.set_agent(role, provider_key, model="claude-code")
+        model = "claude-code"
+        cfg.set_agent(role, provider_key, model)
 
     elif provider_key == "anthropic_api":
         model, api_key = _setup_api_provider(
