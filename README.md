@@ -1,6 +1,6 @@
 # HaufCode
 
-[![CI](https://github.com/VOTRE_USER/haufcode/actions/workflows/ci.yml/badge.svg)](https://github.com/VOTRE_USER/haufcode/actions/workflows/ci.yml)
+[![CI](https://github.com/hauf974/haufcode/actions/workflows/ci.yml/badge.svg)](https://github.com/VOTRE_USER/haufcode/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Licence MIT](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 [![Aucune dépendance](https://img.shields.io/badge/dépendances-aucune-brightgreen.svg)]()
