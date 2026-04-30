@@ -6,17 +6,96 @@ Configuration d'un projet au premier `haufcode start` :
 """
 import getpass
 import json
+import os
 import sys
+import termios
+import tty
 import urllib.error
 import urllib.request
-from typing import Optional
 
 from haufcode.config import ProjectConfig
+
+
+# ── menu flèches ──────────────────────────────────────────────────────────────
+def _pick(prompt: str, options: list, default: int = 0) -> int:
+    """
+    Menu interactif navigable aux flèches haut/bas. Valide avec Entrée.
+    Retourne l'index choisi. Fallback numérique si pas de TTY.
+    """
+    if not sys.stdin.isatty():
+        print(f"\n  {prompt}")
+        for i, opt in enumerate(options, 1):
+            print(f"    {i}) {opt}")
+        while True:
+            try:
+                choice = int(input("  Votre choix : ").strip())
+                if 1 <= choice <= len(options):
+                    return choice - 1
+            except ValueError:
+                pass
+            print(f"  ⚠️  Entrez un nombre entre 1 et {len(options)}.")
+
+    idx = default
+
+    def _render(current: int):
+        sys.stdout.write(f"\033[{len(options) + 1}A")
+        sys.stdout.write(f"\r\033[K  {prompt}\n")
+        for i, opt in enumerate(options):
+            if i == current:
+                sys.stdout.write(f"\r\033[K    \033[1;36m❯ {opt}\033[0m\n")
+            else:
+                sys.stdout.write(f"\r\033[K      {opt}\n")
+        sys.stdout.flush()
+
+    # Premier affichage
+    print(f"\n  {prompt}")
+    for i, opt in enumerate(options):
+        if i == idx:
+            print(f"    \033[1;36m❯ {opt}\033[0m")
+        else:
+            print(f"      {opt}")
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = os.read(fd, 1)
+            if ch == b"\x1b":
+                ch2 = os.read(fd, 1)
+                if ch2 == b"[":
+                    ch3 = os.read(fd, 1)
+                    if ch3 == b"A":        # flèche haut
+                        idx = (idx - 1) % len(options)
+                        _render(idx)
+                    elif ch3 == b"B":      # flèche bas
+                        idx = (idx + 1) % len(options)
+                        _render(idx)
+            elif ch in (b"\r", b"\n"):     # Entrée
+                break
+            elif ch == b"\x03":            # Ctrl+C
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    # Affichage final avec choix confirmé
+    sys.stdout.write(f"\033[{len(options) + 1}A")
+    sys.stdout.write(f"\r\033[K  {prompt}\n")
+    for i, opt in enumerate(options):
+        if i == idx:
+            sys.stdout.write(f"\r\033[K    \033[1m✅ {opt}\033[0m\n")
+        else:
+            sys.stdout.write(f"\r\033[K      {opt}\n")
+    sys.stdout.flush()
+
+    return idx
 
 
 # ── helpers UI ────────────────────────────────────────────────────────────────
 def _hr():
     print("─" * 60)
+
 
 def _ask(prompt: str, default: str = "") -> str:
     if default:
@@ -24,26 +103,13 @@ def _ask(prompt: str, default: str = "") -> str:
         return val if val else default
     return input(f"  {prompt} : ").strip()
 
+
 def _ask_yn(prompt: str, default: bool = True) -> bool:
     yn = "O/n" if default else "o/N"
     ans = input(f"  {prompt} [{yn}] : ").strip().lower()
     if not ans:
         return default
     return ans in ("o", "oui", "y", "yes")
-
-def _pick(prompt: str, options: list) -> int:
-    """Menu de sélection numérotée. Retourne l'index choisi."""
-    print(f"\n  {prompt}")
-    for i, opt in enumerate(options, 1):
-        print(f"    {i}) {opt}")
-    while True:
-        try:
-            choice = int(input("  Votre choix : ").strip())
-            if 1 <= choice <= len(options):
-                return choice - 1
-        except ValueError:
-            pass
-        print(f"  ⚠️  Entrez un nombre entre 1 et {len(options)}.")
 
 
 # ── providers ─────────────────────────────────────────────────────────────────
@@ -68,25 +134,22 @@ ROLE_RECOMMENDATIONS = {
     "TESTER":    "DeepSeek-V3 via OpenRouter",
 }
 
+# Clés API mémorisées en cours de session (évite de les retaper entre les rôles)
+_SESSION_KEYS: dict[str, str] = {}
+
 
 # ── setup principal ───────────────────────────────────────────────────────────
 def run_project_setup(cfg: ProjectConfig):
-    """
-    Lance la configuration interactive du projet.
-    Appelé une seule fois, au premier `haufcode start`.
-    """
+    """Lance la configuration interactive du projet (premier haufcode start)."""
     print()
     _hr()
     print("  HaufCode — Configuration du projet")
     _hr()
     print()
-
-    # ── 1. Agents ─────────────────────────────────────────────────────────────
     print("  Configurez le modèle IA pour chacun des trois rôles.\n")
     for role in ("ARCHITECT", "BUILDER", "TESTER"):
         _configure_agent(cfg, role)
 
-    # ── 2. GitHub ─────────────────────────────────────────────────────────────
     _configure_github(cfg)
 
     cfg.save()
@@ -103,13 +166,10 @@ def _configure_agent(cfg: ProjectConfig, role: str):
     _hr()
     print(f"  Rôle : {ROLE_LABELS[role]}")
     print(f"  💡  Recommandé : {ROLE_RECOMMENDATIONS[role]}")
-    print()
 
-    # Choix du provider
     provider_idx = _pick("Provider :", [label for _, label in PROVIDERS])
     provider_key, _ = PROVIDERS[provider_idx]
 
-    # Récupération / saisie du modèle
     if provider_key == "openrouter":
         model, api_key = _setup_openrouter()
         cfg.set_agent(role, provider_key, model, api_key=api_key)
@@ -144,11 +204,9 @@ def _configure_agent(cfg: ProjectConfig, role: str):
         model, base_url, api_key = _setup_other()
         cfg.set_agent(role, provider_key, model, api_key=api_key, base_url=base_url)
 
-    # Test de connectivité
     print()
     print(f"  🔌  Test de connectivité pour {role} ({provider_key} / {model})…")
-    agent_cfg = cfg.get_agent(role)
-    ok, msg = _test_agent(agent_cfg)
+    ok, msg = _test_agent(cfg.get_agent(role))
     if ok:
         print(f"  ✅  Connectivité OK — {msg}")
     else:
@@ -156,23 +214,36 @@ def _configure_agent(cfg: ProjectConfig, role: str):
         if _ask_yn("Reconfigurer ce rôle ?"):
             _configure_agent(cfg, role)
             return
-
     print()
+
+
+# ── mémorisation des clés API ─────────────────────────────────────────────────
+def _get_api_key(provider: str, label: str) -> str:
+    """
+    Retourne la clé API pour ce provider.
+    Si déjà saisie dans cette session, propose de la réutiliser.
+    """
+    existing = _SESSION_KEYS.get(provider, "")
+    if existing:
+        masked = existing[:4] + "…" + existing[-4:]
+        print(f"  Clé {provider} déjà saisie ({masked})")
+        if _ask_yn("Réutiliser cette clé ?", default=True):
+            return existing
+
+    key = getpass.getpass(f"  {label} (saisie masquée) : ").strip()
+    if key:
+        _SESSION_KEYS[provider] = key
+    return key
 
 
 # ── OpenRouter ────────────────────────────────────────────────────────────────
 def _setup_openrouter() -> tuple[str, str]:
-    """Récupère la liste des modèles OpenRouter via API publique."""
-    api_key = getpass.getpass("  Clé API OpenRouter (saisie masquée) : ").strip()
+    api_key = _get_api_key("openrouter", "Clé API OpenRouter")
     print("  Récupération de la liste des modèles…", end=" ", flush=True)
-
     try:
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/models",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
@@ -181,10 +252,9 @@ def _setup_openrouter() -> tuple[str, str]:
             [m["id"] for m in data.get("data", [])
              if any(tag in m.get("id", "").lower()
                     for tag in ("coder", "instruct", "chat", "qwen", "deepseek", "mistral", "llama"))],
-            key=lambda x: x.lower()
+            key=lambda x: x.lower(),
         )
         print(f"OK ({len(models)} modèles trouvés)")
-
         if not models:
             print("  ⚠️  Aucun modèle trouvé, saisie manuelle.")
             return input("  ID du modèle : ").strip(), api_key
@@ -195,33 +265,27 @@ def _setup_openrouter() -> tuple[str, str]:
     except Exception as e:
         print(f"Erreur ({e})")
         print("  ⚠️  Impossible de récupérer la liste. Saisie manuelle.")
-        model = _ask("ID du modèle (ex: qwen/qwen-2.5-coder-32b-instruct)")
-        return model, api_key
+        return _ask("ID du modèle (ex: qwen/qwen-2.5-coder-32b-instruct)"), api_key
 
 
-# ── Anthropic API / OpenAI (même pattern) ────────────────────────────────────
+# ── Anthropic API / OpenAI ────────────────────────────────────────────────────
 def _setup_api_provider(name: str, models_url: str,
                          auth_header_key: str,
                          auth_header_prefix: str = "") -> tuple[str, str]:
-    """Configuration générique pour providers avec endpoint /v1/models."""
-    api_key = getpass.getpass(f"  Clé API {name} (saisie masquée) : ").strip()
+    provider_id = name.lower().replace(" ", "_")
+    api_key = _get_api_key(provider_id, f"Clé API {name}")
     print(f"  Récupération des modèles {name}…", end=" ", flush=True)
-
     try:
         auth_value = f"{auth_header_prefix}{api_key}" if auth_header_prefix else api_key
         req = urllib.request.Request(
             models_url,
-            headers={
-                auth_header_key: auth_value,
-                "Content-Type": "application/json",
-            }
+            headers={auth_header_key: auth_value, "Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
 
         models = sorted([m["id"] for m in data.get("data", [])], key=lambda x: x.lower())
         print(f"OK ({len(models)} modèles)")
-
         if not models:
             raise ValueError("Liste vide")
 
@@ -231,28 +295,24 @@ def _setup_api_provider(name: str, models_url: str,
     except Exception as e:
         print(f"Erreur ({e})")
         print("  ⚠️  Saisie manuelle du modèle.")
-        model = _ask("ID du modèle")
-        return model, api_key
+        return _ask("ID du modèle"), api_key
 
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
 def _setup_ollama() -> tuple[str, str]:
-    """Récupère les modèles Ollama depuis l'API locale."""
     base_url = _ask("URL Ollama", default="http://localhost:11434").rstrip("/")
     print(f"  Récupération des modèles Ollama sur {base_url}…", end=" ", flush=True)
-
     try:
-        req = urllib.request.Request(f"{base_url}/api/tags")
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(
+            urllib.request.Request(f"{base_url}/api/tags"), timeout=5
+        ) as resp:
             data = json.loads(resp.read())
 
         models = [m["name"] for m in data.get("models", [])]
         print(f"OK ({len(models)} modèles installés)")
-
         if not models:
             print("  ⚠️  Aucun modèle Ollama installé. Saisie manuelle.")
-            model = _ask("Nom du modèle (ex: llama3:8b)")
-            return model, base_url
+            return _ask("Nom du modèle (ex: llama3:8b)"), base_url
 
         idx = _pick("Modèle :", models)
         return models[idx], base_url
@@ -260,23 +320,20 @@ def _setup_ollama() -> tuple[str, str]:
     except Exception as e:
         print(f"Erreur ({e})")
         print("  ⚠️  Ollama non accessible. Vérifiez que le service tourne.")
-        model = _ask("Nom du modèle (saisie manuelle)")
-        return model, base_url
+        return _ask("Nom du modèle (saisie manuelle)"), base_url
 
 
 # ── Autre provider ────────────────────────────────────────────────────────────
 def _setup_other() -> tuple[str, str, str]:
-    """Configuration manuelle d'un provider compatible OpenAI."""
     print("  Configuration d'un provider compatible OpenAI (base URL + clé API).")
     base_url = _ask("URL de base (ex: https://api.monprovider.com/v1)").rstrip("/")
     model = _ask("Nom ou ID du modèle")
-    api_key = getpass.getpass("  Clé API (saisie masquée, laisser vide si non requise) : ").strip()
+    api_key = _get_api_key("other", "Clé API (laisser vide si non requise)")
     return model, base_url, api_key
 
 
 # ── Claude Code CLI ───────────────────────────────────────────────────────────
 def _check_claude_code_cli():
-    """Vérifie que Claude Code CLI est installé et la session active."""
     import shutil
     import subprocess
 
@@ -286,26 +343,17 @@ def _check_claude_code_cli():
         print("  ❌  Claude Code CLI n'est pas installé ou pas dans le PATH.")
         print("  Installez-le : https://docs.anthropic.com/claude-code")
         sys.exit(1)
-
-    # Test rapide : claude --version
     try:
         result = subprocess.run(
-            ["claude", "--version"],
-            capture_output=True, text=True, timeout=5
+            ["claude", "--version"], capture_output=True, text=True, timeout=5
         )
-        version = result.stdout.strip() or result.stderr.strip()
-        print(f"OK ({version})")
+        print(f"OK ({result.stdout.strip() or result.stderr.strip()})")
     except Exception as e:
-        print(f"Erreur ({e})")
-        print("  ⚠️  Impossible de vérifier Claude Code CLI. Continuons quand même.")
+        print(f"Erreur ({e}) — continuons quand même.")
 
 
-# ── test de connectivité agent ────────────────────────────────────────────────
+# ── test de connectivité ──────────────────────────────────────────────────────
 def _test_agent(agent_cfg: dict) -> tuple[bool, str]:
-    """
-    Envoie un prompt minimal à l'agent pour valider la connectivité.
-    Retourne (succès, message).
-    """
     from haufcode.agents import AgentClient
     try:
         client = AgentClient(agent_cfg)
@@ -319,7 +367,6 @@ def _test_agent(agent_cfg: dict) -> tuple[bool, str]:
 
 # ── configuration GitHub ──────────────────────────────────────────────────────
 def _configure_github(cfg: ProjectConfig):
-    """Configuration optionnelle du dépôt GitHub avec test du PAT."""
     _hr()
     print("  Configuration GitHub (optionnelle)")
     print("  Permet les commits automatiques après chaque slice validée.")
@@ -332,7 +379,7 @@ def _configure_github(cfg: ProjectConfig):
         return
 
     while True:
-        token = getpass.getpass("  GitHub Personal Access Token (saisie masquée) : ").strip()
+        token = _get_api_key("github", "GitHub Personal Access Token")
         if not token:
             print("  ⚠️  Token vide.")
             continue
@@ -348,16 +395,15 @@ def _configure_github(cfg: ProjectConfig):
             break
         else:
             print(f"Échec ({login_or_error})")
+            _SESSION_KEYS.pop("github", None)
             if not _ask_yn("Réessayer avec un autre token ?"):
                 cfg.disable_github()
                 print("  ↩️  GitHub désactivé.")
                 break
-
     print()
 
 
 def _test_github_token(token: str) -> tuple[bool, str]:
-    """Teste un GitHub PAT via GET /user. Retourne (succès, login_ou_erreur)."""
     try:
         req = urllib.request.Request(
             "https://api.github.com/user",
@@ -365,7 +411,7 @@ def _test_github_token(token: str) -> tuple[bool, str]:
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
-            }
+            },
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
