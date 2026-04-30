@@ -29,6 +29,7 @@ COMMANDS = {
     "resume":  "Relance l'usine (équivalent haufcode resume)",
     "status":  "Affiche l'état courant",
     "stop":    "Arrête l'usine proprement",
+    "logs":    "Envoie les 30 dernières lignes du log courant",
     "help":    "Liste les commandes disponibles",
 }
 
@@ -154,6 +155,9 @@ def _handle_update(client: TelegramClient, update: dict):
     elif text == "stop":
         _cmd_stop(client)
 
+    elif text == "logs":
+        _cmd_logs(client)
+
     else:
         # Réponse libre → stockée pour que l'Architecte puisse la lire
         _store_human_reply(text)
@@ -223,3 +227,28 @@ def _store_human_reply(text: str):
     if reply_file.parent.exists():
         reply_file.write_text(text)
         logger.info(f"Réponse humaine stockée : {text[:80]}")
+
+
+def _cmd_logs(client: TelegramClient):
+    """Envoie les 30 dernières lignes du log courant via Telegram."""
+    from haufcode.logger import get_latest_log_file
+
+    log_file = get_latest_log_file()
+    if not log_file:
+        client.send_message("❌ Aucun fichier de log trouvé.")
+        return
+
+    try:
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        last_lines = lines[-30:] if len(lines) > 30 else lines
+        if not last_lines:
+            client.send_message("📋 Le fichier de log est vide.")
+            return
+        content = "\n".join(last_lines)
+        msg = f"📋 <b>Dernières lignes de log</b>\n<pre>{content}</pre>"
+        # Telegram limite les messages à 4096 caractères
+        if len(msg) > 4000:
+            msg = "📋 <b>Dernières lignes de log (tronqué)</b>\n<pre>" + content[-(4000 - 60):] + "</pre>"
+        client.send_message(msg)
+    except Exception as e:
+        client.send_message(f"❌ Impossible de lire le log : {e}")
