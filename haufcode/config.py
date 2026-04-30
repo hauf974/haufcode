@@ -159,7 +159,9 @@ class ProjectState:
         self._data: dict = self._default()
         if self._path.exists():
             with open(self._path) as f:
-                self._data = json.load(f)
+                loaded = json.load(f)
+            # Fusionner avec _default() pour ajouter les clés manquantes
+            self._data.update(loaded)
 
     @staticmethod
     def _default() -> dict:
@@ -250,3 +252,7 @@ class ProjectState:
     @last_verdict.setter
     def last_verdict(self, v: str):
         self._data["last_verdict"] = v
+
+    @property
+    def last_updated(self) -> Optional[str]:
+        return self._data.get("last_updated")
