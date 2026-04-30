@@ -40,30 +40,23 @@ class AgentClient:
     def _call_claude_code_cli(self, prompt: str, system: str) -> str:
         """
         Appelle Claude Code via son interface CLI.
-        Utilise un fichier temporaire pour le prompt (évite les problèmes de taille).
+        Passe le prompt via stdin pour fiabilité maximale.
         """
         full_prompt = f"{system}\n\n{prompt}" if system else prompt
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
-                                         delete=False, encoding="utf-8") as f:
-            f.write(full_prompt)
-            tmp_path = f.name
-
-        try:
-            result = subprocess.run(
-                ["claude", "--print", f"@{tmp_path}"],
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5 min max par appel
+        result = subprocess.run(
+            ["claude", "--print"],
+            input=full_prompt,
+            capture_output=True,
+            text=True,
+            timeout=1800,  # 30 min max par appel (init Architecte peut être très long)
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Claude Code CLI erreur (code {result.returncode}) : "
+                f"{result.stderr.strip()}"
             )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Claude Code CLI erreur (code {result.returncode}) : "
-                    f"{result.stderr.strip()}"
-                )
-            return result.stdout.strip()
-        finally:
-            os.unlink(tmp_path)
+        return result.stdout.strip()
 
     # ── OpenAI-compatible (OpenRouter, Anthropic, OpenAI, Ollama, Autre) ──────
     def _call_openai_compat(self, prompt: str, system: str,
