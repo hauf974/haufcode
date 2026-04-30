@@ -51,7 +51,7 @@ class AgentClient:
 
         try:
             result = subprocess.run(
-                ["claude", "--print", "--no-markdown", f"@{tmp_path}"],
+                ["claude", "--print", f"@{tmp_path}"],
                 capture_output=True,
                 text=True,
                 timeout=300,  # 5 min max par appel
