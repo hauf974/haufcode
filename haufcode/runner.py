@@ -131,7 +131,25 @@ class Runner:
 
         # Écrire les fichiers produits par l'Architecte
         written = write_architect_output(response, self.project_dir)
-        self.log.info(f"📁  Fichiers générés : {', '.join(written)}")
+        self.log.info(f"📁  Fichiers écrits : {', '.join(written)}")
+
+        # Vérifier que la planification est exploitable
+        from haufcode.planning import has_planning_files
+        if not has_planning_files(self.project_dir):
+            self.log.error(
+                "❌  Aucun fichier de planification trouvé après init Architecte. "
+                "La réponse a été sauvegardée dans ARCHITECT_OUTPUT.md. "
+                "Vérifiez les permissions d'écriture ou le format de réponse."
+            )
+            # Notifier via Telegram
+            self.telegram.notify_interruption(
+                "L'Architecte n'a pas pu écrire les fichiers de planification. "
+                "Consultez ARCHITECT_OUTPUT.md et les logs.",
+                self.state.phase, self.state.sprint, "init-planning"
+            )
+            self.state.status = "WAITING"
+            self.state.save()
+            raise StopRequested()
 
         record_metric(
             phase=self.state.phase, sprint=self.state.sprint,
@@ -148,9 +166,20 @@ class Runner:
         while True:
             phase_file = PhaseFile(phase_num, self.project_dir)
             if not phase_file.path.exists():
-                self.log.info(f"🏁  Phase {phase_num} non trouvée → projet terminé.")
-                self._project_done()
-                return
+                if phase_num == 1:
+                    # Phase 1 absente = init Architecte a échoué, pas fin de projet
+                    self.log.error(
+                        "❌  PHASE1.md introuvable. "
+                        "L'initialisation de l'Architecte a probablement échoué. "
+                        "Consultez ARCHITECT_OUTPUT.md et les logs."
+                    )
+                    self.state.status = "WAITING"
+                    self.state.save()
+                    raise StopRequested()
+                else:
+                    self.log.info(f"🏁  Phase {phase_num} non trouvée → toutes les phases terminées.")
+                    self._project_done()
+                    return
 
             # Traiter les sprints de la phase
             slices = phase_file.get_all_slices()
@@ -350,16 +379,39 @@ class Runner:
 
     # ── appel agent générique ─────────────────────────────────────────────────
     def _call_agent(self, role: str, prompt: str, system: str) -> str:
-        """Appelle un agent avec logging et gestion d'erreur."""
+        """Appelle un agent avec logging, heartbeat et gestion d'erreur."""
+        import threading
+        import time as _time
+
         hlog.log_prompt(role, prompt)
+        self.log.info(f"⏳  [{role}] Appel en cours… (visible dans haufcode logs)")
+
+        # Heartbeat : log une ligne toutes les 30s pendant l'attente
+        _stop_heartbeat = threading.Event()
+
+        def _heartbeat():
+            elapsed = 0
+            while not _stop_heartbeat.wait(30):
+                elapsed += 30
+                self.log.info(f"⏳  [{role}] Toujours en cours… ({elapsed}s)")
+
+        hb = threading.Thread(target=_heartbeat, daemon=True)
+        hb.start()
+
+        t0 = _time.time()
         try:
             agent = self._agent(role)
             response = agent.call(prompt, system=system)
+            elapsed = int(_time.time() - t0)
+            self.log.info(f"✅  [{role}] Réponse reçue ({elapsed}s, "
+                          f"{len(response)} caractères)")
             hlog.log_response(role, response)
             return response
         except Exception as e:
             hlog.log_error(f"Erreur agent {role}", e)
             raise AutoInterruption(f"Erreur API {role} : {e}")
+        finally:
+            _stop_heartbeat.set()
 
     # ── commit automatique ────────────────────────────────────────────────────
     def _auto_commit(self, sl: Slice):

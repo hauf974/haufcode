@@ -207,32 +207,75 @@ class TodoFile:
 def write_architect_output(content: str, project_dir: str = "."):
     """
     Parse la réponse de l'Architecte et écrit les fichiers correspondants.
-    Détecte les blocs délimités par des marqueurs de fichier.
-    Format attendu dans la réponse de l'Architecte :
+    Supporte plusieurs formats de réponse :
+
+    Format 1 (préféré, demandé dans le prompt) :
       === ARCHITECTURE.md ===
       <contenu>
       === END ===
-      === PHASE1.md ===
+
+    Format 2 (Claude Code CLI écrit souvent ainsi) :
+      **ARCHITECTURE.md**
+      ```markdown
       <contenu>
-      === END ===
+      ```
+
+    Format 3 (blocs de code avec nom de fichier en header) :
+      ```markdown ARCHITECTURE.md
+      <contenu>
+      ```
+
+    Fallback : écrit tout dans ARCHITECT_OUTPUT.md et signale l'erreur.
     """
     proj = Path(project_dir)
-    file_pattern = re.compile(
-        r"===\s*([\w.]+)\s*===\s*\n(.*?)===\s*END\s*===",
+    written = []
+
+    # Format 1 : === FILENAME === ... === END ===
+    pattern1 = re.compile(
+        r"===\s*([\w.-]+\.\w+)\s*===\s*\n(.*?)(?:===\s*END\s*===|(?====\s*[\w.-]+\.\w+\s*===))",
         re.DOTALL | re.IGNORECASE
     )
+    matches1 = pattern1.findall(content)
+    if matches1:
+        for filename, file_content in matches1:
+            out_path = proj / filename.strip()
+            out_path.write_text(file_content.strip(), encoding="utf-8")
+            written.append(str(out_path))
+        return written
 
-    matches = file_pattern.findall(content)
-    if not matches:
-        # Fallback : pas de marqueurs trouvés, on écrit brut dans ARCHITECT_OUTPUT.md
-        out = proj / "ARCHITECT_OUTPUT.md"
-        out.write_text(content, encoding="utf-8")
-        return [str(out)]
+    # Format 2 : **FILENAME.md** suivi d'un bloc ```...```
+    pattern2 = re.compile(
+        r"\*\*([\w.-]+\.(?:md|json|txt|yml|yaml))\*\*\s*\n```[^\n]*\n(.*?)```",
+        re.DOTALL | re.IGNORECASE
+    )
+    matches2 = pattern2.findall(content)
+    if matches2:
+        for filename, file_content in matches2:
+            out_path = proj / filename.strip()
+            out_path.write_text(file_content.strip(), encoding="utf-8")
+            written.append(str(out_path))
+        return written
 
-    written = []
-    for filename, file_content in matches:
-        out_path = proj / filename.strip()
-        out_path.write_text(file_content.strip(), encoding="utf-8")
-        written.append(str(out_path))
+    # Format 3 : ``` lang FILENAME.md (header de bloc de code avec nom de fichier)
+    pattern3 = re.compile(
+        r"```[a-z]*\s+([\w.-]+\.(?:md|json|txt|yml|yaml))\s*\n(.*?)```",
+        re.DOTALL | re.IGNORECASE
+    )
+    matches3 = pattern3.findall(content)
+    if matches3:
+        for filename, file_content in matches3:
+            out_path = proj / filename.strip()
+            out_path.write_text(file_content.strip(), encoding="utf-8")
+            written.append(str(out_path))
+        return written
 
-    return written
+    # Fallback : aucun format reconnu — sauvegarde brute
+    out = proj / "ARCHITECT_OUTPUT.md"
+    out.write_text(content, encoding="utf-8")
+    return [str(out)]
+
+
+def has_planning_files(project_dir: str = ".") -> bool:
+    """Vérifie que l'Architecte a bien produit les fichiers de planification."""
+    proj = Path(project_dir)
+    return (proj / "PHASE1.md").exists() or (proj / "TODO.md").exists()

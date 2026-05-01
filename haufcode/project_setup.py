@@ -194,6 +194,7 @@ def _configure_agent(cfg: ProjectConfig, role: str):
 
     elif provider_key == "claude_code_cli":
         _check_claude_code_cli()
+        _ensure_claude_permissions(cfg)
         model = "claude-code"
         cfg.set_agent(role, provider_key, model)
 
@@ -351,6 +352,39 @@ def _setup_other() -> tuple[str, str, str]:
 
 
 # ── Claude Code CLI ───────────────────────────────────────────────────────────
+def _ensure_claude_permissions(cfg: ProjectConfig):
+    """
+    Crée .claude/settings.json dans le répertoire du projet pour autoriser
+    Claude Code CLI à écrire des fichiers sans demander de confirmation interactive.
+    Sans ce fichier, Claude Code bloque et ne produit aucun fichier.
+    """
+    import json as _json
+
+    claude_dir = cfg._dir / ".claude"
+    settings_path = claude_dir / "settings.json"
+
+    if settings_path.exists():
+        return  # Déjà configuré
+
+    settings = {
+        "permissions": {
+            "allow": [
+                "Write",
+                "Bash(*)"
+            ],
+            "deny": []
+        }
+    }
+
+    try:
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(_json.dumps(settings, indent=2), encoding="utf-8")
+        print(f"  ✅  Permissions Claude Code créées : {settings_path}")
+    except Exception as e:
+        print(f"  ⚠️  Impossible de créer .claude/settings.json : {e}")
+        print("       Créez .claude/settings.json avec : mkdir -p .claude && echo permettant Write et Bash")
+
+
 def _check_claude_code_cli():
     import shutil
     import subprocess
