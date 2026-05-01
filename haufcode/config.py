@@ -12,6 +12,7 @@ GLOBAL_CONFIG_DIR  = Path.home() / ".haufcode"
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.json"
 GLOBAL_LOCK_FILE   = GLOBAL_CONFIG_DIR / "factory.lock"
 LOGS_DIR           = Path("logs")
+METRICS_FILE       = Path("haufcode_metrics.csv")
 
 # ── chemins par projet ────────────────────────────────────────────────────────
 PROJECT_CONFIG_DIR = ".haufcode"
