@@ -104,8 +104,16 @@ class Runner:
     def _architect_init(self) -> bool:
         """
         Premier appel à l'Architecte : planification complète.
+        Skippé si les fichiers de planification existent déjà (reprise après erreur).
         Retourne True si terminé sans attente humaine, False si HUMAN_INPUT_NEEDED.
         """
+        from haufcode.planning import has_planning_files
+
+        # Si les fichiers existent déjà, l'Architecte a déjà travaillé → on saute
+        if has_planning_files(self.project_dir):
+            self.log.info("📁  Fichiers de planification déjà présents — init Architecte skippée.")
+            return True
+
         self.log.info("🏗️  Architecte — Planification initiale…")
         projet_md = Path(self.project_dir) / self.cfg.projet_md
 
@@ -123,7 +131,7 @@ class Runner:
         if "HUMAN_INPUT_NEEDED:" in response:
             question = self._extract_human_question(response)
             self.log.info(f"❓  Architecte demande : {question}")
-            self.telegram.notify_question(question, context="Planification initiale")
+            self._notify_human_needed(question, context="Planification initiale")
             self.state.current_role = "ARCHITECT"
             self.state.status = "WAITING"
             self.state.save()
@@ -374,7 +382,7 @@ class Runner:
 
         if "HUMAN_INPUT_NEEDED:" in response:
             question = self._extract_human_question(response)
-            self.telegram.notify_question(question, context=f"BLOCKED sur {sl.name}")
+            self._notify_human_needed(question, context=f"BLOCKED sur {sl.name}")
             self._wait_human_input()
 
     # ── appel agent générique ─────────────────────────────────────────────────
@@ -429,6 +437,27 @@ class Runner:
         fresh = ProjectState(self.project_dir)
         if fresh.stop_requested:
             raise StopRequested()
+
+    # ── notification humain requis ────────────────────────────────────────────
+    def _notify_human_needed(self, question: str, context: str = ""):
+        """
+        Envoie une notification Telegram avec la question ET les 20 dernières
+        lignes de log pour donner le contexte complet à l'humain.
+        """
+        from haufcode.logger import get_latest_log_file
+
+        # Récupérer les 20 dernières lignes de log
+        log_tail = ""
+        try:
+            log_file = get_latest_log_file()
+            if log_file and log_file.exists():
+                lines = log_file.read_text(encoding="utf-8").splitlines()
+                last_lines = lines[-20:] if len(lines) > 20 else lines
+                log_tail = "\n".join(last_lines)
+        except Exception:
+            log_tail = "(logs non disponibles)"
+
+        self.telegram.notify_question(question, context=context, log_tail=log_tail)
 
     # ── attente réponse humaine ───────────────────────────────────────────────
     def _wait_human_input(self):

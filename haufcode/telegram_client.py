@@ -111,7 +111,8 @@ class TelegramClient:
         )
         self.send_message(msg)
 
-    def notify_question(self, question: str, context: str = ""):
+    def notify_question(self, question: str, context: str = "",
+                          log_tail: str = ""):
         """L'Architecte demande une précision à l'humain."""
         msg = (
             "❓ <b>HaufCode — Question de l'Architecte</b>\n\n"
@@ -119,6 +120,10 @@ class TelegramClient:
             + f"{question}\n\n"
             "Répondez directement à ce message."
         )
+        if log_tail:
+            # Tronquer pour rester sous la limite Telegram (4096 chars)
+            log_preview = log_tail[-800:] if len(log_tail) > 800 else log_tail
+            msg += f"\n\n<b>Derniers logs :</b>\n<pre>{log_preview}</pre>"
         self.send_message(msg)
 
     def notify_phase_complete(self, phase: int):
