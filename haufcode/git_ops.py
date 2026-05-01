@@ -32,6 +32,10 @@ def _run_git(args: list, cwd: str = ".") -> tuple[bool, str]:
 
 def ensure_git_repo(project_dir: str = ".") -> bool:
     """Initialise un dépôt git si nécessaire et crée le .gitignore."""
+    # Créer le .gitignore EN PREMIER avant tout git add
+    # pour éviter de committer des secrets
+    _ensure_gitignore(project_dir)
+
     git_dir = Path(project_dir) / ".git"
     if not git_dir.exists():
         # Forcer la branche main (compatible GitHub)
@@ -50,7 +54,6 @@ def ensure_git_repo(project_dir: str = ".") -> bool:
     if branch and branch != "main":
         _run_git(["checkout", "-b", "main"], cwd=project_dir)
 
-    _ensure_gitignore(project_dir)
     return True
 
 
