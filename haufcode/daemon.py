@@ -197,9 +197,27 @@ def cmd_resume(debug: bool = False):
     if debug:
         print("🐛  Mode debug activé — pause après chaque bascule d'agent.")
 
-    # Lire la réponse humaine si disponible
+    # Lire ou demander la réponse humaine si l'usine attend
     human_reply_file = Path(project_dir) / ".haufcode/human_reply.txt"
-    if human_reply_file.exists():
+    if state.status == "WAITING":
+        # Vérifier si une réponse existe déjà (depuis Telegram)
+        existing_reply = ""
+        if human_reply_file.exists():
+            existing_reply = human_reply_file.read_text(encoding="utf-8").strip()
+
+        if existing_reply:
+            print(f"💬  Réponse Telegram disponible : {existing_reply[:80]}")
+        else:
+            # Demander la réponse en bash
+            print()
+            print("❓  L'Architecte attend une réponse humaine.")
+            print("   (Laissez vide si vous répondrez via Telegram)")
+            reply = input("   Votre réponse : ").strip()
+            if reply:
+                human_reply_file.parent.mkdir(parents=True, exist_ok=True)
+                human_reply_file.write_text(reply, encoding="utf-8")
+                print(f"💬  Réponse enregistrée.")
+    elif human_reply_file.exists():
         reply = human_reply_file.read_text(encoding="utf-8").strip()
         if reply:
             print(f"💬  Réponse humaine transmise à l'Architecte : {reply[:80]}")

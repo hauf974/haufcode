@@ -576,12 +576,13 @@ class Runner:
 
     def _collect_project_files(self, sl: Slice) -> str:
         """
-        Collecte le contenu des fichiers du projet pour le Tester.
-        Lit tous les fichiers source pertinents (js, ts, py, json, etc.)
-        en excluant les dossiers volumineux (node_modules, .git, etc.).
-        Limite la taille totale pour éviter de dépasser le contexte du modèle.
+        Collecte les fichiers pertinents pour la slice en cours.
+        Stratégie en deux passes :
+          1. Fichiers prioritaires : mentionnés dans le raw_block de la slice
+          2. Fichiers secondaires : reste du projet dans la limite de chars restants
         """
         import os
+        import re
 
         EXCLUDED_DIRS = {
             "node_modules", ".git", ".haufcode", "__pycache__",
@@ -592,45 +593,73 @@ class Runner:
             ".env.example", ".sql", ".sh", ".ejs", ".html",
             ".css", ".md", ".txt", ".dockerfile", ""
         }
-        MAX_TOTAL_CHARS = 40_000  # ~10k tokens, raisonnable pour un Tester
-        MAX_FILE_CHARS = 8_000   # par fichier
+        IGNORED_FILES = {"TODO.md", "ARCHITECTURE.md", "ARCHITECT_OUTPUT.md",
+                         "package-lock.json", "yarn.lock"}
+        MAX_TOTAL_CHARS = 60_000  # augmenté car on priorise maintenant
+        MAX_FILE_CHARS  = 10_000  # par fichier
 
-        collected = []
-        total_chars = 0
         proj = Path(self.project_dir)
 
-        for root, dirs, files in os.walk(proj):
-            # Exclure les dossiers inutiles
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
+        # ── Passe 1 : extraire les noms de fichiers mentionnés dans la slice ──
+        slice_text = sl.raw_block or ""
+        mentioned = set(re.findall(
+            r'[\w./\-]+\.(?:js|ts|py|ejs|html|css|json|sql|sh|md)', slice_text
+        ))
 
+        def _read_entry(filepath: Path):
+            try:
+                rel = str(filepath.relative_to(proj))
+                if filepath.name in IGNORED_FILES:
+                    return None, None
+                if rel.startswith("PHASE"):
+                    return None, None
+                text = filepath.read_text(encoding="utf-8", errors="replace")
+                if len(text) > MAX_FILE_CHARS:
+                    text = text[:MAX_FILE_CHARS] + f"\n... [tronqué à {MAX_FILE_CHARS} chars]"
+                return rel, f"### {rel}\n```\n{text}\n```\n"
+            except Exception:
+                return None, None
+
+        collected: list[str] = []
+        seen: set[str] = set()
+        total_chars = 0
+
+        # Passe 1 — fichiers mentionnés dans la slice (prioritaires)
+        for root, dirs, files in os.walk(proj):
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
+            for filename in sorted(files):
+                filepath = Path(root) / filename
+                rel, entry = _read_entry(filepath)
+                if not entry or rel in seen:
+                    continue
+                if not any(m in rel or rel.endswith(m) for m in mentioned):
+                    continue
+                if total_chars + len(entry) <= MAX_TOTAL_CHARS:
+                    collected.append(entry)
+                    seen.add(rel)
+                    total_chars += len(entry)
+
+        # Passe 2 — reste des fichiers dans la limite restante
+        for root, dirs, files in os.walk(proj):
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
             for filename in sorted(files):
                 ext = Path(filename).suffix.lower()
                 if ext not in INCLUDED_EXTENSIONS and not filename.startswith("Dockerfile"):
                     continue
-
                 filepath = Path(root) / filename
-                rel_path = filepath.relative_to(proj)
-
-                # Ignorer les fichiers de planification HaufCode et artefacts
-                if filename in ("TODO.md", "ARCHITECTURE.md", "ARCHITECT_OUTPUT.md"):
+                rel, entry = _read_entry(filepath)
+                if not entry or rel in seen:
                     continue
-                if str(rel_path).startswith("PHASE"):
-                    continue
-
-                try:
-                    content = filepath.read_text(encoding="utf-8", errors="replace")
-                    if len(content) > MAX_FILE_CHARS:
-                        content = content[:MAX_FILE_CHARS] + f"\n... [tronqué à {MAX_FILE_CHARS} chars]"
-
-                    entry = f"### {rel_path}\n```\n{content}\n```\n"
-                    if total_chars + len(entry) > MAX_TOTAL_CHARS:
-                        collected.append(f"### [Limite atteinte — {total_chars} chars collectés]")
-                        break
-
+                if total_chars >= MAX_TOTAL_CHARS:
+                    collected.append(
+                        f"### [Limite atteinte — {total_chars} chars, "
+                        f"fichiers restants non inclus]"
+                    )
+                    break
+                if total_chars + len(entry) <= MAX_TOTAL_CHARS:
                     collected.append(entry)
+                    seen.add(rel)
                     total_chars += len(entry)
-                except Exception:
-                    continue
 
         if not collected:
             return "(Aucun fichier source trouvé dans le répertoire du projet)"
