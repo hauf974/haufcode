@@ -19,6 +19,7 @@ import subprocess
 from pathlib import Path
 
 # ── Patterns de parsing ───────────────────────────────────────────────────────
+# Format standard : WRITE_FILE: chemin\n```\ncontenu\n```
 _WRITE_FILE_RE = re.compile(
     r'WRITE_FILE:\s*(\S+)\s*\n```[^\n]*\n(.*?)```',
     re.DOTALL
@@ -26,6 +27,11 @@ _WRITE_FILE_RE = re.compile(
 _RUN_RE = re.compile(r'^RUN:\s*(.+)$', re.MULTILINE)
 # RUN: à l'intérieur de blocs ```bash ... ``` (certains modèles utilisent ce format)
 _BASH_BLOCK_RE = re.compile(r'```(?:bash|sh)\s*\n(.*?)```', re.DOTALL)
+# Format alternatif Mistral : WRITE_FILE:\n   Path: chemin\n   Content: |\n     contenu
+_WRITE_FILE_ALT_RE = re.compile(
+    r'WRITE_FILE:\s*\n\s*[Pp]ath:\s*(\S+)\s*\n\s*[Cc]ontent:\s*\|?\s*\n(.*?)(?=\n\s*WRITE_FILE:|\nRUN:|\nNEXT:|\Z)',
+    re.DOTALL
+)
 
 MAX_OUTPUT_CHARS = 3000   # tronquer les outputs longs avant de les renvoyer
 RUN_TIMEOUT      = 120    # secondes max par commande
@@ -43,13 +49,12 @@ def parse_and_execute(response: str, project_dir: str) -> tuple[bool, str]:
     report_lines = []
     has_actions = False
 
-    # ── WRITE_FILE ────────────────────────────────────────────────────────────
+    # ── WRITE_FILE format standard ────────────────────────────────────────────
     for match in _WRITE_FILE_RE.finditer(response):
         has_actions = True
         rel_path = match.group(1).strip()
         content  = match.group(2)
 
-        # Sécurité : ne pas écrire en dehors du projet
         target = (proj / rel_path).resolve()
         if not str(target).startswith(str(proj)):
             report_lines.append(f"❌ WRITE_FILE refusé (hors projet) : {rel_path}")
@@ -61,6 +66,26 @@ def parse_and_execute(response: str, project_dir: str) -> tuple[bool, str]:
             report_lines.append(f"✅ WRITE_FILE : {rel_path} ({len(content)} chars)")
         except Exception as e:
             report_lines.append(f"❌ WRITE_FILE échoué : {rel_path} → {e}")
+
+    # ── WRITE_FILE format alternatif (Path: / Content:) ──────────────────────
+    for match in _WRITE_FILE_ALT_RE.finditer(response):
+        has_actions = True
+        rel_path = match.group(1).strip()
+        raw = match.group(2)
+        lines = raw.splitlines()
+        indent = min((len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0)
+        content_str = "\n".join(ln[indent:] if len(ln) >= indent else ln for ln in lines).strip()
+
+        target = (proj / rel_path).resolve()
+        if not str(target).startswith(str(proj)):
+            report_lines.append(f"❌ WRITE_FILE (alt) refusé (hors projet) : {rel_path}")
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content_str, encoding="utf-8")
+            report_lines.append(f"✅ WRITE_FILE (alt) : {rel_path} ({len(content_str)} chars)")
+        except Exception as e:
+            report_lines.append(f"❌ WRITE_FILE (alt) échoué : {rel_path} → {e}")
 
     # ── RUN ───────────────────────────────────────────────────────────────────
     # Collecter les commandes RUN: standard + celles dans les blocs ```bash
@@ -79,7 +104,6 @@ def parse_and_execute(response: str, project_dir: str) -> tuple[bool, str]:
         has_actions = True
         cmd = match.group(1).strip()
 
-        # Commandes dangereuses bloquées
         blocked = ["rm -rf /", ":(){ :|:& };:", "mkfs", "dd if=/dev/zero"]
         if any(b in cmd for b in blocked):
             report_lines.append(f"❌ RUN bloqué (dangereux) : {cmd}")
