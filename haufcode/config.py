@@ -7,24 +7,24 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# ── chemins ───────────────────────────────────────────────────────────────────
-GLOBAL_CONFIG_DIR = Path.home() / ".haufcode"
+# ── chemins globaux ───────────────────────────────────────────────────────────
+GLOBAL_CONFIG_DIR  = Path.home() / ".haufcode"
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.json"
-GLOBAL_PID_FILE = GLOBAL_CONFIG_DIR / "telegram.pid"
-GLOBAL_LOCK_FILE = GLOBAL_CONFIG_DIR / "haufcode.lock"
+GLOBAL_LOCK_FILE   = GLOBAL_CONFIG_DIR / "factory.lock"
+LOGS_DIR           = Path("logs")
 
+# ── chemins par projet ────────────────────────────────────────────────────────
 PROJECT_CONFIG_DIR = ".haufcode"
-PROJECT_CONFIG_FILE = ".haufcode/config.json"
+PROJECT_PID_FILE   = ".haufcode/haufcode.pid"
 PROJECT_STATE_FILE = ".haufcode/state.json"
-PROJECT_PID_FILE = ".haufcode/haufcode.pid"
-PROJECT_TELEGRAM_PID_FILE = ".haufcode/telegram.pid"
-METRICS_FILE = "haufcode_metrics.csv"
-LOGS_DIR = "logs"
 
 
-# ── configuration globale ─────────────────────────────────────────────────────
+# ── Configuration globale ─────────────────────────────────────────────────────
 class GlobalConfig:
-    """Configuration globale : Telegram, lien symbolique."""
+    """
+    Configuration globale de HaufCode (~/.haufcode/config.json).
+    Contient : token Telegram, chat ID, flag symlink.
+    """
 
     def __init__(self):
         self._data: dict = {}
@@ -40,7 +40,6 @@ class GlobalConfig:
         with open(GLOBAL_CONFIG_FILE, "w") as f:
             json.dump(self._data, f, indent=2)
 
-    # ── accesseurs ──────────────────────────────────────────────────────────
     @property
     def telegram_token(self) -> str:
         return self._data.get("telegram_token", "")
@@ -66,27 +65,16 @@ class GlobalConfig:
         self._data["symlink_created"] = value
 
 
-# ── configuration projet ──────────────────────────────────────────────────────
+# ── Configuration par projet ──────────────────────────────────────────────────
 class ProjectConfig:
     """
-    Configuration d'un projet spécifique.
-    Stockée dans <répertoire_projet>/.haufcode/config.json
+    Configuration d'un projet (.haufcode/config.json dans le répertoire projet).
+    Contient : agents IA (provider, model, api_key), GitHub token/repo.
     """
-
-    ROLES = ("ARCHITECT", "BUILDER", "TESTER")
-
-    PROVIDERS = (
-        "openrouter",
-        "claude_code_cli",
-        "anthropic_api",
-        "openai",
-        "ollama",
-        "other",
-    )
 
     def __init__(self, project_dir: Optional[str] = None):
         self._dir = Path(project_dir) if project_dir else Path.cwd()
-        self._config_path = self._dir / PROJECT_CONFIG_FILE
+        self._config_path = self._dir / PROJECT_CONFIG_DIR / "config.json"
         self._data: dict = {}
         if self._config_path.exists():
             with open(self._config_path) as f:
@@ -96,14 +84,11 @@ class ProjectConfig:
         return self._config_path.exists() and bool(self._data.get("agents"))
 
     def save(self):
-        config_dir = self._dir / PROJECT_CONFIG_DIR
-        config_dir.mkdir(parents=True, exist_ok=True)
+        self._config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._config_path, "w") as f:
             json.dump(self._data, f, indent=2)
 
-    # ── agents ───────────────────────────────────────────────────────────────
     def get_agent(self, role: str) -> dict:
-        """Retourne la config agent pour un rôle (ARCHITECT/BUILDER/TESTER)."""
         return self._data.get("agents", {}).get(role, {})
 
     def set_agent(self, role: str, provider: str, model: str,
@@ -117,7 +102,6 @@ class ProjectConfig:
             "base_url": base_url,
         }
 
-    # ── github ────────────────────────────────────────────────────────────────
     @property
     def github_enabled(self) -> bool:
         return self._data.get("github", {}).get("enabled", False)
@@ -136,7 +120,6 @@ class ProjectConfig:
     def disable_github(self):
         self._data["github"] = {"enabled": False}
 
-    # ── projet ────────────────────────────────────────────────────────────────
     @property
     def projet_md(self) -> str:
         return self._data.get("projet_md", "")
@@ -146,7 +129,7 @@ class ProjectConfig:
         self._data["projet_md"] = value
 
 
-# ── état courant du projet ────────────────────────────────────────────────────
+# ── État de l'usine ───────────────────────────────────────────────────────────
 class ProjectState:
     """
     État courant de l'usine : phase/sprint/slice active, rôle, itérations.
@@ -160,8 +143,10 @@ class ProjectState:
         if self._path.exists():
             with open(self._path) as f:
                 loaded = json.load(f)
-            # Fusionner avec _default() pour ajouter les clés manquantes
-            self._data.update(loaded)
+            # Fusionner : _default() fournit les valeurs manquantes,
+            # loaded écrase uniquement les clés qu'il contient.
+            # Ordre important : default d'abord, loaded ensuite.
+            self._data = {**self._default(), **loaded}
 
     @staticmethod
     def _default() -> dict:
@@ -189,7 +174,6 @@ class ProjectState:
         self._data = self._default()
         self.save()
 
-    # ── accesseurs ──────────────────────────────────────────────────────────
     @property
     def phase(self) -> int:
         return self._data["phase"]
@@ -253,6 +237,14 @@ class ProjectState:
     @last_verdict.setter
     def last_verdict(self, v: str):
         self._data["last_verdict"] = v
+
+    @property
+    def debug_mode(self) -> bool:
+        return self._data.get("debug_mode", False)
+
+    @debug_mode.setter
+    def debug_mode(self, v: bool):
+        self._data["debug_mode"] = v
 
     @property
     def last_updated(self) -> Optional[str]:
