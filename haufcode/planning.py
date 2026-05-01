@@ -45,7 +45,7 @@ class PhaseFile:
 
     # Regex de détection des blocs de slice — supporte S1-2 et S3-3a
     SLICE_HEADER = re.compile(
-        r"^##\s+Slice\s+(S\d+-\w+)\s*:\s*(.+)$", re.MULTILINE
+        r"^#{2,3}\s+(?:Slice\s+)?(S?[\d]+[.-][\w.-]+)\s*:?\s*(.+)$", re.MULTILINE
     )
     STATUS_LINE = re.compile(r"\*\*Statut\*\*\s*:\s*(\w+)")
     ITERATIONS_LINE = re.compile(r"\*\*Itérations\*\*\s*:\s*(\d+)")
@@ -82,16 +82,26 @@ class PhaseFile:
             slice_name = m.group(2).strip()
 
             # Extraire phase et sprint depuis l'ID
-            parts = slice_id[1:].split("-")  # retire le "S" initial
+            # Formats supportés : S1-2, S3-3a, 1.1-1, 1.2-3
+            sid = slice_id.lstrip("S")
             try:
-                phase = int(parts[0])
-                # Le sprint est le premier chiffre de la partie après le tiret
-                sprint_raw = re.match(r"(\d+)", parts[1])
-                sprint = int(sprint_raw.group(1)) if sprint_raw else 1
-                # L'index est la valeur numérique complète après le tiret
-                index_raw = re.match(r"(\d+)", parts[1])
-                index = int(index_raw.group(1)) if index_raw else 0
-            except (IndexError, ValueError):
+                if "." in sid:
+                    # Format 1.1-2 : phase.sprint-index
+                    phase_part, rest = sid.split(".", 1)
+                    sprint_part = rest.split("-")[0] if "-" in rest else rest
+                    index_part = rest.split("-")[1] if "-" in rest else rest
+                    phase = int(phase_part)
+                    sprint = int(re.match(r"(\d+)", sprint_part).group(1))
+                    index = int(re.match(r"(\d+)", index_part).group(1))
+                else:
+                    # Format S1-2 ou S1-3a : phase-index
+                    parts = sid.split("-", 1)
+                    phase = int(parts[0])
+                    sprint_raw = re.match(r"(\d+)", parts[1]) if len(parts) > 1 else None
+                    sprint = int(sprint_raw.group(1)) if sprint_raw else 1
+                    index_raw = re.match(r"(\d+)", parts[1]) if len(parts) > 1 else None
+                    index = int(index_raw.group(1)) if index_raw else 0
+            except (IndexError, ValueError, AttributeError):
                 phase = self.phase_num
                 sprint = 1
                 index = 0
