@@ -6,14 +6,13 @@ Gère les verdicts PASS / FAIL / BLOCKED, les itérations, les revues de sprint/
 import re
 import time
 from pathlib import Path
-from typing import Optional
 
 import haufcode.git_ops as git_ops
 from haufcode import logger as hlog
 from haufcode.agents import AgentClient, get_agent
 from haufcode.config import GlobalConfig, ProjectConfig, ProjectState
 from haufcode.metrics import record as record_metric
-from haufcode.planning import PhaseFile, Slice, TodoFile, write_architect_output
+from haufcode.planning import PhaseFile, Slice, write_architect_output
 from haufcode.prompts import (
     ARCHITECT_INIT_PROMPT,
     ARCHITECT_SYSTEM,
@@ -261,8 +260,24 @@ class Runner:
                 self.state.save()
 
                 builder_prompt = self._build_builder_prompt(sl, tester_notes, iterations)
-                self._call_agent("BUILDER", builder_prompt, BUILDER_SYSTEM)
+                builder_response = self._call_agent("BUILDER", builder_prompt, BUILDER_SYSTEM)
                 duration_builder = time.time() - t0
+
+                # Réponse tronquée = le Builder n'a rien produit
+                # On incrémente les itérations et on relance sans passer au Tester
+                if len(builder_response.strip()) < 200:
+                    self.log.warning(
+                        f"⚠️  Builder réponse tronquée ({len(builder_response)} chars) — "
+                        f"relance sans passer au Tester. Réponse : {repr(builder_response[:80])}"
+                    )
+                    record_metric(
+                        phase=sl.phase, sprint=sl.sprint,
+                        role="BUILDER", agent_name=self._agent_name("BUILDER"),
+                        slice_name=sl.name, duration_s=duration_builder,
+                        statut="TRUNCATED"
+                    )
+                    phase_file.update_slice_status(sl.id, "IN_PROGRESS", iterations)
+                    continue  # relancer la boucle while True
 
                 record_metric(
                     phase=sl.phase, sprint=sl.sprint,
@@ -475,16 +490,23 @@ class Runner:
     def _build_builder_prompt(self, sl: Slice, tester_notes: str,
                                iteration: int) -> str:
         arch_md = self._read_file("ARCHITECTURE.md")
-        phase_md = self._read_file(f"PHASE{sl.phase}.md")
+        # Note : on n'inclut PAS tout PHASE{N}.md pour ne pas surcharger le contexte
+        # du Builder (Qwen tronque silencieusement les prompts trop longs).
+        # La slice contient déjà tous les critères d'acceptation nécessaires.
 
         prompt = (
             f"# Tâche Builder — Itération {iteration}\n\n"
             f"## Slice à implémenter\n{sl.raw_block}\n\n"
-            f"## Architecture du projet\n{arch_md}\n\n"
-            f"## Contexte de la phase\n{phase_md}\n"
+            f"## Architecture du projet\n{arch_md}\n"
         )
         if tester_notes:
             prompt += f"\n## Remarques du Tester (itération précédente)\n{tester_notes}\n"
+        prompt += (
+            "\n## Instructions"
+            "\nÉcris le code complet pour satisfaire les critères d'acceptation. "
+            "Crée ou modifie les fichiers nécessaires. "
+            "Indique clairement chaque fichier créé/modifié et son contenu complet."
+        )
         return prompt
 
     def _build_tester_prompt(self, sl: Slice) -> str:
