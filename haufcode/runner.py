@@ -390,6 +390,10 @@ class Runner:
             while not _stop_heartbeat.wait(30):
                 elapsed += 30
                 self.log.info(f"⏳  [{role}] Toujours en cours… ({elapsed}s)")
+                # Vérifier stop_requested pendant les longs appels
+                fresh = ProjectState(self.project_dir)
+                if fresh.stop_requested:
+                    _stop_heartbeat.set()  # Signal pour sortir de la boucle
 
         hb = threading.Thread(target=_heartbeat, daemon=True)
         hb.start()
@@ -407,6 +411,9 @@ class Runner:
             raise AutoInterruption(f"Erreur API {role} : {e}")
         finally:
             _stop_heartbeat.set()
+
+        # Vérifier stop après chaque appel agent (pas seulement entre slices)
+        self._check_stop_requested()
 
         self._debug_pause(role, response)
         return response

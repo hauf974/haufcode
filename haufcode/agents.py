@@ -59,16 +59,22 @@ class AgentClient:
             if turn == MAX_AGENTIC_TURNS - 1:
                 return response
 
-            # Ajouter la réponse du modèle + les résultats d'exécution
-            messages.append({"role": "assistant", "content": response})
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Résultats d'exécution :\n{execution_report}\n\n"
-                    "Continue si nécessaire (autres fichiers à écrire, "
-                    "erreurs à corriger). Si tout est fait, termine par NEXT: TESTER."
+            # Vérifier s'il y a des erreurs dans les résultats
+            has_errors = "ERREUR" in execution_report or "TIMEOUT" in execution_report or "EXCEPTION" in execution_report
+            feedback = (
+                f"Résultats d'exécution :\n{execution_report}\n\n"
+            )
+            if has_errors:
+                feedback += (
+                    "⚠️ Des erreurs ont été détectées. Tu DOIS corriger ces erreurs avant de continuer. "
+                    "Analyse chaque ERREUR et écris les corrections avec WRITE_FILE et RUN.\n"
+                    "Ne passe PAS à NEXT: TESTER tant que toutes les commandes ne retournent pas OK (code 0)."
                 )
-            })
+            else:
+                feedback += "Continue si nécessaire. Si tout est fait et fonctionne, termine par NEXT: TESTER."
+
+            messages.append({"role": "assistant", "content": response})
+            messages.append({"role": "user", "content": feedback})
 
         return response
 
