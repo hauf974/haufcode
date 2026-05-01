@@ -80,6 +80,10 @@ class Runner:
             self.state.status = "STOPPED"
             self.state.save()
 
+        except HumanInputNeeded:
+            # WAITING déjà sauvegardé dans _wait_human_input, on ne touche pas au statut
+            self.log.info("⏳  Usine en WAITING — reprenez avec 'haufcode resume' après avoir répondu.")
+
         except DebugPause:
             # WAITING déjà sauvegardé dans _debug_pause, on ne touche pas au statut
             self.log.info("🐛  Pause debug. Relancez avec 'haufcode resume [--debug]'.")
@@ -521,8 +525,7 @@ class Runner:
         self.state.status = "WAITING"
         self.state.save()
         self.log.info("⏳  En attente d'une réponse humaine via Telegram…")
-        # Le runner s'arrête ici ; `haufcode resume` relancera le démon
-        raise StopRequested()
+        raise HumanInputNeeded()
 
     # ── construction des prompts ──────────────────────────────────────────────
     def _build_builder_prompt(self, sl: Slice, tester_notes: str,
@@ -718,6 +721,9 @@ class Runner:
 # ── exceptions internes ───────────────────────────────────────────────────────
 class StopRequested(Exception):
     """Arrêt propre demandé (volontaire)."""
+
+class HumanInputNeeded(Exception):
+    """L'Architecte attend une réponse humaine — statut WAITING déjà sauvegardé."""
 
 class DebugPause(Exception):
     """Pause mode debug après bascule d'agent."""
