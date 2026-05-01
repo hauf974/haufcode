@@ -16,6 +16,11 @@ from haufcode.config import (
     GLOBAL_PID_FILE,
     ProjectState,
 )
+from haufcode.daemon import (
+    DEBUG_PROMPT_MARKER,
+    _get_last_project_dir,
+    _is_factory_running,
+)
 from haufcode.telegram_client import TelegramClient
 
 logger = logging.getLogger("haufcode.telegram_listener")
@@ -27,6 +32,7 @@ COMMANDS = {
     "status":  "Affiche l'état courant",
     "stop":    "Arrête l'usine proprement",
     "logs":    "Envoie les 30 dernières lignes du log courant",
+    "promptarchitect": "Envoie un message libre à l'Architecte",
     "help":    "Liste les commandes disponibles",
 }
 
@@ -42,24 +48,19 @@ def start_listener(token: str, chat_id: str) -> int:
     Fork un processus fils qui tourne en arrière-plan.
     Retourne le PID du fils, ou 0 en cas d'échec.
     """
-    # Arrêter l'ancien listener s'il existe
     _stop_existing_listener()
 
     try:
         pid = os.fork()
     except AttributeError:
-        # Windows : pas de fork — le listener ne tourne pas
         logger.warning("os.fork() non disponible. Listener Telegram désactivé.")
         return 0
 
     if pid > 0:
-        # Processus parent : enregistre le PID et retourne
         GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         GLOBAL_PID_FILE.write_text(str(pid))
         return pid
 
-    # ── Processus fils ────────────────────────────────────────────────────────
-    # Double-fork pour détacher complètement du terminal
     try:
         if os.fork() > 0:
             os._exit(0)
@@ -68,13 +69,11 @@ def start_listener(token: str, chat_id: str) -> int:
 
     os.setsid()
 
-    # Rediriger stdin/stdout/stderr vers /dev/null
     devnull = open(os.devnull, "r+")
     os.dup2(devnull.fileno(), sys.stdin.fileno())
     os.dup2(devnull.fileno(), sys.stdout.fileno())
     os.dup2(devnull.fileno(), sys.stderr.fileno())
 
-    # Configurer le logging vers un fichier
     log_path = GLOBAL_CONFIG_DIR / "telegram_listener.log"
     logging.basicConfig(
         filename=str(log_path),
@@ -107,7 +106,6 @@ def _run_listener_loop(token: str, chat_id: str):
     client = TelegramClient(token, chat_id)
     offset = None
 
-    # Stocker le PID réel du processus détaché
     GLOBAL_PID_FILE.write_text(str(os.getpid()))
 
     logger.info(f"Listener démarré (PID {os.getpid()})")
@@ -159,8 +157,6 @@ def _handle_update(client: TelegramClient, update: dict):
         _cmd_prompt_architect_telegram(client)
 
     else:
-        # Réponse libre → stockée pour que l'Architecte puisse la lire
-        # Sauf si on attend un prompt architecte
         if _is_awaiting_architect_prompt(client, text):
             return
         _store_human_reply(text)
@@ -226,14 +222,12 @@ def _cmd_stop(client: TelegramClient):
         client.send_message(f"❌ Impossible d'arrêter l'usine : {e}")
 
 
-
 # ── état "en attente prompt architecte" ──────────────────────────────────────
 _AWAITING_ARCHITECT_PROMPT: dict[str, bool] = {}
 
 
 def _cmd_prompt_architect_telegram(client: TelegramClient):
     """Telegram : active le mode saisie de message pour l'Architecte."""
-    from haufcode.daemon import _is_factory_running, _get_last_project_dir
     if _is_factory_running():
         client.send_message("❌ L'usine tourne. Stoppez-la d'abord.")
         return
@@ -255,8 +249,6 @@ def _is_awaiting_architect_prompt(client: TelegramClient, text: str) -> bool:
 
     _AWAITING_ARCHITECT_PROMPT.clear()
 
-    from haufcode.daemon import _get_last_project_dir, DEBUG_PROMPT_MARKER
-    from pathlib import Path
     project_dir = _get_last_project_dir()
     if not project_dir:
         client.send_message("❌ Aucun projet actif.")
@@ -301,7 +293,6 @@ def _cmd_logs(client: TelegramClient):
             return
         content = "\n".join(last_lines)
         msg = f"📋 <b>Dernières lignes de log</b>\n<pre>{content}</pre>"
-        # Telegram limite les messages à 4096 caractères
         if len(msg) > 4000:
             msg = "📋 <b>Dernières lignes de log (tronqué)</b>\n<pre>" + content[-(4000 - 60):] + "</pre>"
         client.send_message(msg)
