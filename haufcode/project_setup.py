@@ -16,7 +16,7 @@ import urllib.request
 from haufcode.config import ProjectConfig
 
 # ── menu flèches avec fenêtre scrollable ──────────────────────────────────────
-MENU_HEIGHT = 12  # nombre de lignes visibles dans le menu
+MENU_HEIGHT = 20  # nombre de lignes visibles dans le menu
 
 
 def _pick(prompt: str, options: list, default: int = 0) -> int:
@@ -270,7 +270,9 @@ def _setup_openrouter() -> tuple[str, str]:
         models = sorted(
             [m["id"] for m in data.get("data", [])
              if any(tag in m.get("id", "").lower()
-                    for tag in ("coder", "instruct", "chat", "qwen", "deepseek", "mistral", "llama"))],
+                    for tag in ("coder", "instruct", "chat", "qwen", "deepseek",
+                                "mistral", "llama", "gemini", "gpt", "claude",
+                                "command", "phi", "wizard", "yi", "kimi", "nova"))],
             key=lambda x: x.lower(),
         )
         print(f"OK ({len(models)} modèles trouvés)")
