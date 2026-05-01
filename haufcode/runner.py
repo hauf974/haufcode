@@ -488,14 +488,89 @@ class Runner:
         return prompt
 
     def _build_tester_prompt(self, sl: Slice) -> str:
+        """
+        Construit le prompt du Tester en incluant le contenu réel des fichiers
+        implémentés par le Builder. Sans ça, le Tester ne peut pas vérifier le code
+        et rend systématiquement BLOCKED.
+        """
         phase_md = self._read_file(f"PHASE{sl.phase}.md")
+
+        # Collecter les fichiers pertinents pour cette slice
+        # Le Builder les a créés dans le répertoire du projet
+        code_context = self._collect_project_files(sl)
+
         prompt = (
             f"# Tâche Tester\n\n"
             f"## Slice à vérifier\n{sl.raw_block}\n\n"
             f"## Contexte de la phase\n{phase_md}\n\n"
-            "Inspecte le code dans le dépôt et rends ton verdict (PASS/FAIL/BLOCKED)."
+            f"## Code implémenté par le Builder\n{code_context}\n\n"
+            "Inspecte le code ci-dessus et rends ton verdict (PASS/FAIL/BLOCKED).\n"
+            "BLOCKED ne doit être utilisé que si le code est structurellement impossible à vérifier "
+            "(dépendance manquante, ambiguïté de spec), pas parce qu'un fichier semble absent — "
+            "vérifie d'abord dans le code fourni ci-dessus."
         )
         return prompt
+
+    def _collect_project_files(self, sl: Slice) -> str:
+        """
+        Collecte le contenu des fichiers du projet pour le Tester.
+        Lit tous les fichiers source pertinents (js, ts, py, json, etc.)
+        en excluant les dossiers volumineux (node_modules, .git, etc.).
+        Limite la taille totale pour éviter de dépasser le contexte du modèle.
+        """
+        import os
+
+        EXCLUDED_DIRS = {
+            "node_modules", ".git", ".haufcode", "__pycache__",
+            "dist", "build", ".next", "coverage", "logs"
+        }
+        INCLUDED_EXTENSIONS = {
+            ".js", ".ts", ".py", ".json", ".yaml", ".yml",
+            ".env.example", ".sql", ".sh", ".ejs", ".html",
+            ".css", ".md", ".txt", ".dockerfile", ""
+        }
+        MAX_TOTAL_CHARS = 40_000  # ~10k tokens, raisonnable pour un Tester
+        MAX_FILE_CHARS = 8_000   # par fichier
+
+        collected = []
+        total_chars = 0
+        proj = Path(self.project_dir)
+
+        for root, dirs, files in os.walk(proj):
+            # Exclure les dossiers inutiles
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
+
+            for filename in sorted(files):
+                ext = Path(filename).suffix.lower()
+                if ext not in INCLUDED_EXTENSIONS and not filename.startswith("Dockerfile"):
+                    continue
+
+                filepath = Path(root) / filename
+                rel_path = filepath.relative_to(proj)
+
+                # Ignorer les fichiers de planification HaufCode
+                if filename in ("TODO.md", "ARCHITECTURE.md") or str(rel_path).startswith("PHASE"):
+                    continue
+
+                try:
+                    content = filepath.read_text(encoding="utf-8", errors="replace")
+                    if len(content) > MAX_FILE_CHARS:
+                        content = content[:MAX_FILE_CHARS] + f"\n... [tronqué à {MAX_FILE_CHARS} chars]"
+
+                    entry = f"### {rel_path}\n```\n{content}\n```\n"
+                    if total_chars + len(entry) > MAX_TOTAL_CHARS:
+                        collected.append(f"### [Limite atteinte — {total_chars} chars collectés]")
+                        break
+
+                    collected.append(entry)
+                    total_chars += len(entry)
+                except Exception:
+                    continue
+
+        if not collected:
+            return "(Aucun fichier source trouvé dans le répertoire du projet)"
+
+        return "\n".join(collected)
 
     def _build_architect_rescue_prompt(self, sl: Slice, notes: str) -> str:
         return (

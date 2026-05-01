@@ -102,12 +102,12 @@ class TelegramClient:
 
     def notify_blocked(self, phase: int, sprint: int, slice_name: str,
                         reason: str):
-        """Notifie un blocage (BLOCKED)."""
+        """Notifie un blocage (BLOCKED) — l'Architecte prend en charge automatiquement."""
         msg = (
             f"🔒 <b>BLOCKED</b> — Phase {phase} / Sprint {sprint}\n"
             f"Slice : <code>{slice_name}</code>\n"
             f"Motif : {reason}\n\n"
-            "Répondez avec des précisions pour débloquer l'Architecte."
+            "⚙️ L'Architecte prend en charge automatiquement."
         )
         self.send_message(msg)
 
