@@ -24,6 +24,8 @@ _WRITE_FILE_RE = re.compile(
     re.DOTALL
 )
 _RUN_RE = re.compile(r'^RUN:\s*(.+)$', re.MULTILINE)
+# RUN: à l'intérieur de blocs ```bash ... ``` (certains modèles utilisent ce format)
+_BASH_BLOCK_RE = re.compile(r'```(?:bash|sh)\s*\n(.*?)```', re.DOTALL)
 
 MAX_OUTPUT_CHARS = 3000   # tronquer les outputs longs avant de les renvoyer
 RUN_TIMEOUT      = 120    # secondes max par commande
@@ -61,7 +63,19 @@ def parse_and_execute(response: str, project_dir: str) -> tuple[bool, str]:
             report_lines.append(f"❌ WRITE_FILE échoué : {rel_path} → {e}")
 
     # ── RUN ───────────────────────────────────────────────────────────────────
-    for match in _RUN_RE.finditer(response):
+    # Collecter les commandes RUN: standard + celles dans les blocs ```bash
+    run_commands: list = list(_RUN_RE.finditer(response))
+    for bash_match in _BASH_BLOCK_RE.finditer(response):
+        bash_content = bash_match.group(1)
+        for line in bash_content.splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and not line.startswith('EOF'):
+                class _FakeMatch:
+                    def __init__(self, cmd): self._cmd = cmd
+                    def group(self, n): return self._cmd
+                run_commands.append(_FakeMatch(line))
+
+    for match in run_commands:
         has_actions = True
         cmd = match.group(1).strip()
 
@@ -106,4 +120,8 @@ def parse_and_execute(response: str, project_dir: str) -> tuple[bool, str]:
 
 def has_actions(response: str) -> bool:
     """Retourne True si la réponse contient des actions à exécuter."""
-    return bool(_WRITE_FILE_RE.search(response) or _RUN_RE.search(response))
+    return bool(
+        _WRITE_FILE_RE.search(response)
+        or _RUN_RE.search(response)
+        or _BASH_BLOCK_RE.search(response)
+    )

@@ -56,10 +56,10 @@ class Runner:
         self.state.save()
         self.log.info("🏭  HaufCode démarré.")
 
-        # Message utilisateur en attente pour l'Architecte ?
-        self._inject_architect_prompt_if_pending()
-
         try:
+            # Message utilisateur en attente pour l'Architecte ?
+            self._inject_architect_prompt_if_pending()
+
             if self.state.current_role == "ARCHITECT" and self.state.slice_index == 0:
                 arch_done = self._architect_init()
                 if not arch_done:
