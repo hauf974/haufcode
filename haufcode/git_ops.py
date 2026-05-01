@@ -31,7 +31,7 @@ def _run_git(args: list, cwd: str = ".") -> tuple[bool, str]:
 
 
 def ensure_git_repo(project_dir: str = ".") -> bool:
-    """Initialise un dépôt git si nécessaire."""
+    """Initialise un dépôt git si nécessaire et crée le .gitignore."""
     git_dir = Path(project_dir) / ".git"
     if not git_dir.exists():
         ok, msg = _run_git(["init"], cwd=project_dir)
@@ -39,8 +39,69 @@ def ensure_git_repo(project_dir: str = ".") -> bool:
             logger.info("Dépôt git initialisé.")
         else:
             logger.error(f"Impossible d'initialiser git : {msg}")
-        return ok
+            return ok
+
+    _ensure_gitignore(project_dir)
     return True
+
+
+GITIGNORE_CONTENT = """# HaufCode — fichiers exclus du suivi git
+# Configurations et secrets
+.haufcode/
+.env
+
+# Claude Code
+.claude/
+
+# Logs et métriques
+logs/
+haufcode_metrics.csv
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Données runtime (montées par Docker)
+data/database.sqlite
+data/sessions.sqlite
+data/images/
+
+# Build
+dist/
+build/
+.next/
+coverage/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+"""
+
+
+def _ensure_gitignore(project_dir: str = "."):
+    """Crée ou complète le .gitignore du projet."""
+    gitignore_path = Path(project_dir) / ".gitignore"
+    if gitignore_path.exists():
+        # Vérifier que .haufcode/ y est bien
+        content = gitignore_path.read_text(encoding="utf-8")
+        if ".haufcode/" not in content:
+            with open(gitignore_path, "a", encoding="utf-8") as f:
+                f.write("\n# HaufCode\n.haufcode/\n.claude/\nlogs/\nhaufcode_metrics.csv\n")
+            logger.info(".gitignore mis à jour avec les entrées HaufCode.")
+    else:
+        gitignore_path.write_text(GITIGNORE_CONTENT, encoding="utf-8")
+        logger.info(".gitignore créé.")
 
 
 def commit_slice(phase: int, sprint: int, slice_name: str,
