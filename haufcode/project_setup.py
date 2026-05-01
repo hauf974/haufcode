@@ -181,6 +181,17 @@ def run_project_setup(cfg: ProjectConfig):
 # ── configuration d'un agent ──────────────────────────────────────────────────
 def _configure_agent(cfg: ProjectConfig, role: str):
     """Configure le provider + modèle pour un rôle donné."""
+    # Pré-charger les clés API déjà connues depuis la config existante
+    # (évite de ressaisir le token OpenRouter lors d'un changeagents)
+    for r in ("ARCHITECT", "BUILDER", "TESTER"):
+        existing = cfg.get_agent(r)
+        if existing.get("provider") == "openrouter" and existing.get("api_key"):
+            _SESSION_KEYS.setdefault("openrouter", existing["api_key"])
+        if existing.get("provider") == "anthropic_api" and existing.get("api_key"):
+            _SESSION_KEYS.setdefault("anthropic_api", existing["api_key"])
+        if existing.get("provider") == "openai" and existing.get("api_key"):
+            _SESSION_KEYS.setdefault("openai", existing["api_key"])
+
     _hr()
     print(f"  Rôle : {ROLE_LABELS[role]}")
     print(f"  💡  Recommandé : {ROLE_RECOMMENDATIONS[role]}")
