@@ -435,7 +435,8 @@ class Runner:
         t0 = _time.time()
         try:
             agent = self._agent(role)
-            response = agent.call(prompt, system=system)
+            response = agent.call(prompt, system=system,
+                                  project_dir=self.project_dir)
             elapsed = int(_time.time() - t0)
             self.log.info(f"✅  [{role}] Réponse reçue ({elapsed}s, "
                           f"{len(response)} caractères)")

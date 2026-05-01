@@ -24,16 +24,53 @@ class AgentClient:
         self.base_url = agent_cfg.get("base_url", "")
 
     def call(self, prompt: str, system: str = "",
-             max_tokens: int = 4096) -> str:
+             max_tokens: int = 4096,
+             project_dir: str = ".") -> str:
         """
         Envoie un prompt à l'agent et retourne la réponse texte.
-        Lève une exception en cas d'erreur.
+        Si la réponse contient des actions WRITE_FILE/RUN, les exécute
+        et renvoie les résultats au modèle pour qu'il puisse itérer.
         """
+        from haufcode.executor import parse_and_execute, has_actions as _has_actions
+
         if self.provider == "claude_code_cli":
             return self._call_claude_code_cli(prompt, system)
 
-        # Tous les autres providers via API HTTP compatible OpenAI
-        return self._call_openai_compat(prompt, system, max_tokens)
+        # Boucle agent : réponse → exécution → réponse...
+        messages = self._build_messages(prompt, system)
+        MAX_AGENTIC_TURNS = 5
+
+        for turn in range(MAX_AGENTIC_TURNS):
+            response = self._call_openai_compat_messages(messages, max_tokens)
+
+            # Vérifier s'il y a des actions à exécuter
+            if not _has_actions(response):
+                return response  # Réponse finale sans actions
+
+            # Exécuter les actions et collecter les résultats
+            _, execution_report = parse_and_execute(response, project_dir)
+
+            import logging
+            logging.getLogger("haufcode").info(
+                f"  ⚙️  Actions exécutées (tour {turn + 1}) :\n{execution_report}"
+            )
+
+            # Dernier tour : retourner la réponse telle quelle
+            if turn == MAX_AGENTIC_TURNS - 1:
+                return response
+
+            # Ajouter la réponse du modèle + les résultats d'exécution
+            messages.append({"role": "assistant", "content": response})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Résultats d'exécution :\n{execution_report}\n\n"
+                    "Continue si nécessaire (autres fichiers à écrire, "
+                    "erreurs à corriger). Si tout est fait, termine par NEXT: TESTER."
+                )
+            })
+
+        return response
 
     # ── Claude Code CLI ───────────────────────────────────────────────────────
     def _call_claude_code_cli(self, prompt: str, system: str) -> str:
@@ -72,16 +109,19 @@ class AgentClient:
         return stdout.strip()
 
     # ── OpenAI-compatible (OpenRouter, Anthropic, OpenAI, Ollama, Autre) ──────
-    def _call_openai_compat(self, prompt: str, system: str,
-                             max_tokens: int) -> str:
-        """Appelle n'importe quel provider via l'API OpenAI-compatible."""
-        base_url = self._resolve_base_url()
-        url = f"{base_url}/chat/completions"
-
+    def _build_messages(self, prompt: str, system: str) -> list:
+        """Construit la liste de messages initiale."""
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def _call_openai_compat_messages(self, messages: list,
+                                      max_tokens: int) -> str:
+        """Appelle le provider avec une liste de messages complète."""
+        base_url = self._resolve_base_url()
+        url = f"{base_url}/chat/completions"
 
         payload = {
             "model": self.model,
@@ -94,7 +134,6 @@ class AgentClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        # OpenRouter ajoute des headers spécifiques
         if self.provider == "openrouter":
             headers["HTTP-Referer"] = "https://github.com/haufcode"
             headers["X-Title"] = "HaufCode"
@@ -109,14 +148,12 @@ class AgentClient:
             body = e.read().decode(errors="replace")
             raise RuntimeError(f"HTTP {e.code} depuis {self.provider} : {body}")
 
-        # Extraction de la réponse avec logging du finish_reason
         try:
             choice = result["choices"][0]
             finish_reason = choice.get("finish_reason", "unknown")
             content = choice["message"].get("content") or ""
             content = content.strip()
 
-            # Logger le finish_reason pour détecter les troncatures
             if finish_reason not in ("stop", "end_turn"):
                 import logging
                 logging.getLogger("haufcode").warning(

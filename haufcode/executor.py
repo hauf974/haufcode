@@ -1,0 +1,110 @@
+"""
+HaufCode — executor.py
+Parse et exécute les actions déclarées dans les réponses des agents.
+
+Format supporté dans les réponses des modèles :
+
+  WRITE_FILE: chemin/vers/fichier.ext
+  ```
+  contenu du fichier
+  ```
+
+  RUN: commande shell
+
+Python exécute ces actions dans le répertoire du projet,
+puis retourne les résultats au modèle pour qu'il puisse itérer.
+"""
+import re
+import subprocess
+from pathlib import Path
+
+
+# ── Patterns de parsing ───────────────────────────────────────────────────────
+_WRITE_FILE_RE = re.compile(
+    r'WRITE_FILE:\s*(\S+)\s*\n```[^\n]*\n(.*?)```',
+    re.DOTALL
+)
+_RUN_RE = re.compile(r'^RUN:\s*(.+)$', re.MULTILINE)
+
+MAX_OUTPUT_CHARS = 3000   # tronquer les outputs longs avant de les renvoyer
+RUN_TIMEOUT      = 120    # secondes max par commande
+
+
+def parse_and_execute(response: str, project_dir: str) -> tuple[bool, str]:
+    """
+    Parse une réponse de modèle, exécute les actions WRITE_FILE et RUN.
+
+    Retourne (has_actions, execution_report) :
+      - has_actions   : True si au moins une action a été trouvée
+      - execution_report : résumé des actions exécutées + outputs
+    """
+    proj = Path(project_dir).resolve()
+    report_lines = []
+    has_actions = False
+
+    # ── WRITE_FILE ────────────────────────────────────────────────────────────
+    for match in _WRITE_FILE_RE.finditer(response):
+        has_actions = True
+        rel_path = match.group(1).strip()
+        content  = match.group(2)
+
+        # Sécurité : ne pas écrire en dehors du projet
+        target = (proj / rel_path).resolve()
+        if not str(target).startswith(str(proj)):
+            report_lines.append(f"❌ WRITE_FILE refusé (hors projet) : {rel_path}")
+            continue
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            report_lines.append(f"✅ WRITE_FILE : {rel_path} ({len(content)} chars)")
+        except Exception as e:
+            report_lines.append(f"❌ WRITE_FILE échoué : {rel_path} → {e}")
+
+    # ── RUN ───────────────────────────────────────────────────────────────────
+    for match in _RUN_RE.finditer(response):
+        has_actions = True
+        cmd = match.group(1).strip()
+
+        # Commandes dangereuses bloquées
+        blocked = ["rm -rf /", ":(){ :|:& };:", "mkfs", "dd if=/dev/zero"]
+        if any(b in cmd for b in blocked):
+            report_lines.append(f"❌ RUN bloqué (dangereux) : {cmd}")
+            continue
+
+        report_lines.append(f"▶ RUN : {cmd}")
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=str(proj),
+                timeout=RUN_TIMEOUT,
+            )
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+
+            if result.returncode == 0:
+                out = stdout or "(pas de sortie)"
+                if len(out) > MAX_OUTPUT_CHARS:
+                    out = out[:MAX_OUTPUT_CHARS] + "\n... [tronqué]"
+                report_lines.append(f"  → OK (code 0)\n  stdout: {out}")
+            else:
+                err = stderr or stdout or "(pas de message)"
+                if len(err) > MAX_OUTPUT_CHARS:
+                    err = err[:MAX_OUTPUT_CHARS] + "\n... [tronqué]"
+                report_lines.append(f"  → ERREUR (code {result.returncode})\n  stderr: {err}")
+
+        except subprocess.TimeoutExpired:
+            report_lines.append(f"  → TIMEOUT ({RUN_TIMEOUT}s dépassé)")
+        except Exception as e:
+            report_lines.append(f"  → EXCEPTION : {e}")
+
+    report = "\n".join(report_lines) if report_lines else ""
+    return has_actions, report
+
+
+def has_actions(response: str) -> bool:
+    """Retourne True si la réponse contient des actions à exécuter."""
+    return bool(_WRITE_FILE_RE.search(response) or _RUN_RE.search(response))
