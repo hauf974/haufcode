@@ -49,9 +49,10 @@ def _check_root():
 
 
 # ── onboarding principal ──────────────────────────────────────────────────────
-def run_onboarding():
+def run_onboarding(require_root: bool = False):
     """Lance la procédure interactive d'onboarding / mise à jour globale."""
-    _check_root()
+    if require_root:
+        _check_root()
 
     cfg = GlobalConfig()
     is_update = cfg.exists()

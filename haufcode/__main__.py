@@ -97,13 +97,13 @@ def main():
         if not cfg.exists():
             print("⚙️  Première utilisation détectée. Lancement de l'onboarding…\n")
             from haufcode.onboarding import run_onboarding
-            run_onboarding()
+            run_onboarding(require_root=False)  # pas de sudo requis au premier lancement auto
             if command == "init":
                 sys.exit(0)
 
     if command == "init":
         from haufcode.onboarding import run_onboarding
-        run_onboarding()
+        run_onboarding(require_root=True)
 
     elif command == "start":
         positional = [a for a in args if not a.startswith("-")]
