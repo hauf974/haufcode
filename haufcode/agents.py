@@ -4,10 +4,10 @@ Couche d'abstraction pour appeler les agents IA.
 Supporte : OpenRouter, Anthropic API, OpenAI, Ollama, Claude Code CLI, Autre.
 """
 import json
-import subprocess
-import urllib.request
-import urllib.error
 import os
+import subprocess
+import urllib.error
+import urllib.request
 from typing import Optional
 
 

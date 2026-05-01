@@ -216,7 +216,7 @@ def cmd_resume(debug: bool = False):
             if reply:
                 human_reply_file.parent.mkdir(parents=True, exist_ok=True)
                 human_reply_file.write_text(reply, encoding="utf-8")
-                print(f"💬  Réponse enregistrée.")
+                print("💬  Réponse enregistrée.")
     elif human_reply_file.exists():
         reply = human_reply_file.read_text(encoding="utf-8").strip()
         if reply:
