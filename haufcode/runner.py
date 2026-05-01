@@ -507,7 +507,10 @@ class Runner:
             "Inspecte le code ci-dessus et rends ton verdict (PASS/FAIL/BLOCKED).\n"
             "BLOCKED ne doit être utilisé que si le code est structurellement impossible à vérifier "
             "(dépendance manquante, ambiguïté de spec), pas parce qu'un fichier semble absent — "
-            "vérifie d'abord dans le code fourni ci-dessus."
+            "vérifie d'abord dans le code fourni ci-dessus.\n"
+            "IMPORTANT : Si tu vois un fichier ARCHITECT_OUTPUT.md contenant un message sur les "
+            "permissions d'écriture, ignore-le complètement — c'est un artefact obsolète. "
+            "Concentre-toi uniquement sur les fichiers de code source réels."
         )
         return prompt
 
@@ -548,8 +551,10 @@ class Runner:
                 filepath = Path(root) / filename
                 rel_path = filepath.relative_to(proj)
 
-                # Ignorer les fichiers de planification HaufCode
-                if filename in ("TODO.md", "ARCHITECTURE.md") or str(rel_path).startswith("PHASE"):
+                # Ignorer les fichiers de planification HaufCode et artefacts
+                if filename in ("TODO.md", "ARCHITECTURE.md", "ARCHITECT_OUTPUT.md"):
+                    continue
+                if str(rel_path).startswith("PHASE"):
                     continue
 
                 try:
