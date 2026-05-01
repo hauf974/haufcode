@@ -171,10 +171,11 @@ class ProjectState:
             "slice_index": 0,
             "current_role": "ARCHITECT",
             "iterations": 0,
-            "status": "IDLE",          # IDLE | RUNNING | WAITING | STOPPED | DONE
+            "status": "IDLE",
             "stop_requested": False,
             "last_verdict": None,
             "last_updated": None,
+            "debug_mode": False,
         }
 
     def save(self):

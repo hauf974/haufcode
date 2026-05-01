@@ -80,6 +80,10 @@ class Runner:
             self.state.status = "STOPPED"
             self.state.save()
 
+        except DebugPause:
+            # WAITING déjà sauvegardé dans _debug_pause, on ne touche pas au statut
+            self.log.info("🐛  Pause debug. Relancez avec 'haufcode resume [--debug]'.")
+
         except AutoInterruption as e:
             self.log.error(f"⚠️  Interruption automatique : {e}")
             self.state.status = "WAITING"
@@ -429,12 +433,46 @@ class Runner:
             self.log.info(f"✅  [{role}] Réponse reçue ({elapsed}s, "
                           f"{len(response)} caractères)")
             hlog.log_response(role, response)
-            return response
         except Exception as e:
             hlog.log_error(f"Erreur agent {role}", e)
             raise AutoInterruption(f"Erreur API {role} : {e}")
         finally:
             _stop_heartbeat.set()
+
+        # Mode debug : pause après chaque réponse agent
+        self._debug_pause(role, response)
+
+        return response
+
+    def _debug_pause(self, role: str, response: str):
+        """
+        En mode debug, envoie une notification Telegram avec un résumé
+        de la réponse, puis passe en WAITING.
+        L'usine reprendra après 'haufcode resume' ou commande Telegram.
+        """
+        fresh = ProjectState(self.project_dir)
+        if not fresh.debug_mode:
+            return
+
+        # Résumé de la réponse (100 premiers chars)
+        preview = response[:200].replace("\n", " ").strip()
+        if len(response) > 200:
+            preview += "…"
+
+        msg = (
+            f"🐛 <b>DEBUG — Fin [{role}]</b>\n\n"
+            f"Phase {self.state.phase} / Sprint {self.state.sprint} / "
+            f"Slice {self.state.slice_index}\n\n"
+            f"💬 Réponse ({len(response)} chars) :\n"
+            f"<pre>{preview}</pre>\n\n"
+            "Répondez <code>resume</code> pour continuer."
+        )
+        self.telegram.send_message(msg)
+        self.log.info(f"🐛  [DEBUG] Pause après [{role}] — en attente resume.")
+
+        self.state.status = "WAITING"
+        self.state.save()
+        raise DebugPause()
 
     # ── commit automatique ────────────────────────────────────────────────────
     def _auto_commit(self, sl: Slice):
@@ -651,6 +689,9 @@ class Runner:
 # ── exceptions internes ───────────────────────────────────────────────────────
 class StopRequested(Exception):
     """Arrêt propre demandé (volontaire)."""
+
+class DebugPause(Exception):
+    """Pause mode debug après bascule d'agent."""
 
 class AutoInterruption(Exception):
     """Interruption automatique (erreur API, quota, etc.)."""
