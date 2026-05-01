@@ -15,12 +15,15 @@ import urllib.request
 
 from haufcode.config import ProjectConfig
 
+# ── menu flèches avec fenêtre scrollable ──────────────────────────────────────
+MENU_HEIGHT = 12  # nombre de lignes visibles dans le menu
 
-# ── menu flèches ──────────────────────────────────────────────────────────────
+
 def _pick(prompt: str, options: list, default: int = 0) -> int:
     """
-    Menu interactif navigable aux flèches haut/bas. Valide avec Entrée.
-    Retourne l'index choisi. Fallback numérique si pas de TTY.
+    Menu interactif navigable aux flèches haut/bas, avec fenêtre scrollable.
+    Affiche au plus MENU_HEIGHT options à la fois. Valide avec Entrée.
+    Fallback numérique si pas de TTY.
     """
     if not sys.stdin.isatty():
         print(f"\n  {prompt}")
@@ -36,11 +39,18 @@ def _pick(prompt: str, options: list, default: int = 0) -> int:
             print(f"  ⚠️  Entrez un nombre entre 1 et {len(options)}.")
 
     idx = default
+    n = len(options)
+    win = min(MENU_HEIGHT, n)  # hauteur réelle de la fenêtre
+    # offset = première option visible
+    offset = max(0, min(idx - win // 2, n - win))
 
-    def _render(current: int):
-        sys.stdout.write(f"\033[{len(options) + 1}A")
-        sys.stdout.write(f"\r\033[K  {prompt}\n")
-        for i, opt in enumerate(options):
+    def _render(current: int, off: int):
+        # Remonter d'exactement win+1 lignes (prompt + win options)
+        sys.stdout.write(f"\033[{win + 1}A")
+        sys.stdout.write(f"\r\033[K  {prompt}  "
+                         f"[{current + 1}/{n}]\n")
+        for i in range(off, off + win):
+            opt = options[i]
             if i == current:
                 sys.stdout.write(f"\r\033[K    \033[1;36m❯ {opt}\033[0m\n")
             else:
@@ -48,8 +58,9 @@ def _pick(prompt: str, options: list, default: int = 0) -> int:
         sys.stdout.flush()
 
     # Premier affichage
-    print(f"\n  {prompt}")
-    for i, opt in enumerate(options):
+    print(f"\n  {prompt}  [{idx + 1}/{n}]")
+    for i in range(offset, offset + win):
+        opt = options[i]
         if i == idx:
             print(f"    \033[1;36m❯ {opt}\033[0m")
         else:
@@ -65,28 +76,35 @@ def _pick(prompt: str, options: list, default: int = 0) -> int:
                 ch2 = os.read(fd, 1)
                 if ch2 == b"[":
                     ch3 = os.read(fd, 1)
-                    if ch3 == b"A":        # flèche haut
-                        idx = (idx - 1) % len(options)
-                        _render(idx)
-                    elif ch3 == b"B":      # flèche bas
-                        idx = (idx + 1) % len(options)
-                        _render(idx)
-            elif ch in (b"\r", b"\n"):     # Entrée
+                    if ch3 == b"A":   # flèche haut
+                        idx = (idx - 1) % n
+                    elif ch3 == b"B": # flèche bas
+                        idx = (idx + 1) % n
+                    else:
+                        continue
+                    # Recalculer l'offset pour garder idx visible
+                    if idx < offset:
+                        offset = idx
+                    elif idx >= offset + win:
+                        offset = idx - win + 1
+                    offset = max(0, min(offset, n - win))
+                    _render(idx, offset)
+            elif ch in (b"\r", b"\n"):  # Entrée
                 break
-            elif ch == b"\x03":            # Ctrl+C
+            elif ch == b"\x03":          # Ctrl+C
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                 raise KeyboardInterrupt
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
-    # Affichage final avec choix confirmé
-    sys.stdout.write(f"\033[{len(options) + 1}A")
+    # Affichage final : effacer le menu, afficher le choix sur une ligne
+    sys.stdout.write(f"\033[{win + 1}A")
     sys.stdout.write(f"\r\033[K  {prompt}\n")
-    for i, opt in enumerate(options):
-        if i == idx:
-            sys.stdout.write(f"\r\033[K    \033[1m✅ {opt}\033[0m\n")
-        else:
-            sys.stdout.write(f"\r\033[K      {opt}\n")
+    sys.stdout.write(f"\r\033[K    \033[1m✅ {options[idx]}\033[0m\n")
+    # Effacer les lignes restantes du menu
+    for _ in range(win - 1):
+        sys.stdout.write("\r\033[K\n")
+    sys.stdout.write(f"\033[{win - 1}A")
     sys.stdout.flush()
 
     return idx
