@@ -10,6 +10,7 @@ from typing import Optional
 GLOBAL_CONFIG_DIR  = Path.home() / ".haufcode"
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.json"
 GLOBAL_LOCK_FILE   = GLOBAL_CONFIG_DIR / "factory.lock"
+GLOBAL_PID_FILE    = GLOBAL_CONFIG_DIR / "telegram.pid"
 LOGS_DIR           = Path("logs")
 METRICS_FILE       = Path("haufcode_metrics.csv")
 
