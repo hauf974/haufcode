@@ -1,61 +1,51 @@
 """
 HaufCode — planning.py
-Lecture et écriture des fichiers de planification :
-  - TODO.md     : état global de toutes les slices
-  - PHASEx.md   : détail des slices d'une phase
-  - ARCHITECTURE.md : vision technique (lecture seule par le runner)
-
-Le format est défini par l'Architecte mais cette classe fournit les primitives
-pour extraire les verdicts et mettre à jour les statuts.
+Lecture et écriture des fichiers de planification PHASEx.md et TODO.md.
+Extraction des slices, mise à jour des statuts, écriture de l'output de l'Architecte.
 """
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 
-# ── structures de données ──────────────────────────────────────────────────────
-@dataclass
+# ── Slice ─────────────────────────────────────────────────────────────────────
 class Slice:
-    """Représente une slice atomique de travail."""
-    id: str                    # ex: S1-0
-    name: str                  # ex: auth-middleware
-    phase: int
-    sprint: int
-    index: int
-    status: str = "TODO"       # TODO | IN_PROGRESS | PASS | FAIL | BLOCKED
-    iterations: int = 0
-    acceptance_criteria: list = field(default_factory=list)
-    tester_notes: str = ""
-    raw_block: str = ""        # bloc Markdown brut
+    """Représente une slice extraite d'un PHASEx.md."""
+
+    def __init__(self,
+                 id: str,           # ex: "S1-2"
+                 name: str,
+                 phase: int,
+                 sprint: int,
+                 index: int,        # position numérique dans la phase
+                 status: str,
+                 iterations: int,
+                 raw_block: str,
+                 tester_notes: str = ""):
+        self.id = id
+        self.name = name
+        self.phase = phase
+        self.sprint = sprint
+        self.index = index
+        self.status = status
+        self.iterations = iterations
+        self.raw_block = raw_block
+        self.tester_notes = tester_notes
+
+    def __repr__(self):
+        return f"Slice({self.id}, {self.status})"
 
 
-@dataclass
-class Sprint:
-    id: int
-    phase: int
-    slices: list = field(default_factory=list)
-    status: str = "TODO"       # TODO | IN_PROGRESS | DONE
-
-
-@dataclass
-class Phase:
-    id: int
-    title: str = ""
-    sprints: list = field(default_factory=list)
-    status: str = "TODO"
-
-
-# ── parseur de PHASEx.md ──────────────────────────────────────────────────────
+# ── PhaseFile ─────────────────────────────────────────────────────────────────
 class PhaseFile:
     """
     Lecture/écriture d'un fichier PHASEx.md.
     Le format attendu est celui produit par l'Architecte selon les prompts embarqués.
     """
 
-    # Regex de détection des blocs de slice
+    # Regex de détection des blocs de slice — supporte S1-2 et S3-3a
     SLICE_HEADER = re.compile(
-        r"^##\s+Slice\s+(S\d+-\d+)\s*:\s*(.+)$", re.MULTILINE
+        r"^##\s+Slice\s+(S\d+-\w+)\s*:\s*(.+)$", re.MULTILINE
     )
     STATUS_LINE = re.compile(r"\*\*Statut\*\*\s*:\s*(\w+)")
     ITERATIONS_LINE = re.compile(r"\*\*Itérations\*\*\s*:\s*(\d+)")
@@ -88,194 +78,157 @@ class PhaseFile:
             if not m:
                 continue
 
-            slice_id = m.group(1)   # ex: S1-0
+            slice_id = m.group(1).strip()   # ex: "S1-2" ou "S3-3a"
             slice_name = m.group(2).strip()
 
-            # Extraction sprint/index depuis l'ID
-            parts = slice_id.lstrip("S").split("-")
-            sprint_num = int(parts[0]) if parts else 1
-            slice_idx = int(parts[1]) if len(parts) > 1 else 0
+            # Extraire phase et sprint depuis l'ID
+            parts = slice_id[1:].split("-")  # retire le "S" initial
+            try:
+                phase = int(parts[0])
+                # Le sprint est le premier chiffre de la partie après le tiret
+                sprint_raw = re.match(r"(\d+)", parts[1])
+                sprint = int(sprint_raw.group(1)) if sprint_raw else 1
+                # L'index est la valeur numérique complète après le tiret
+                index_raw = re.match(r"(\d+)", parts[1])
+                index = int(index_raw.group(1)) if index_raw else 0
+            except (IndexError, ValueError):
+                phase = self.phase_num
+                sprint = 1
+                index = 0
 
-            status_m = self.STATUS_LINE.search(block)
-            status = status_m.group(1).upper() if status_m else "TODO"
+            # Statut
+            sm = self.STATUS_LINE.search(block)
+            status = sm.group(1).upper() if sm else "TODO"
 
-            iter_m = self.ITERATIONS_LINE.search(block)
-            iterations = int(iter_m.group(1)) if iter_m else 0
+            # Itérations
+            im = self.ITERATIONS_LINE.search(block)
+            iterations = int(im.group(1)) if im else 0
 
-            criteria = self.CRITERIA_ITEM.findall(block)
+            # Notes Tester
+            nm = self.TESTER_NOTES.search(block)
+            tester_notes = nm.group(1).strip() if nm else ""
 
-            notes_m = self.TESTER_NOTES.search(block)
-            tester_notes = notes_m.group(1).strip() if notes_m else ""
-
-            sl = Slice(
+            self._slices.append(Slice(
                 id=slice_id,
                 name=slice_name,
-                phase=self.phase_num,
-                sprint=sprint_num,
-                index=slice_idx,
+                phase=phase,
+                sprint=sprint,
+                index=index,
                 status=status,
                 iterations=iterations,
-                acceptance_criteria=criteria,
+                raw_block=block.strip(),
                 tester_notes=tester_notes,
-                raw_block=block,
-            )
-            self._slices.append(sl)
+            ))
 
-    # ── accès aux slices ──────────────────────────────────────────────────────
     def get_all_slices(self) -> list[Slice]:
-        return self._slices
+        return list(self._slices)
 
-    def get_next_todo_slice(self) -> Optional[Slice]:
-        """Retourne la prochaine slice à traiter (statut TODO ou IN_PROGRESS)."""
-        for sl in self._slices:
-            if sl.status in ("TODO", "IN_PROGRESS", "FAIL"):
-                return sl
-        return None
+    def get_slices_for_sprint(self, sprint_num: int) -> list[Slice]:
+        return [sl for sl in self._slices if sl.sprint == sprint_num]
 
-    def get_slices_for_sprint(self, sprint: int) -> list[Slice]:
-        return [sl for sl in self._slices if sl.sprint == sprint]
-
-    # ── mise à jour d'une slice ───────────────────────────────────────────────
     def update_slice_status(self, slice_id: str, status: str,
-                             iterations: int, tester_notes: str = ""):
+                             iterations: int,
+                             tester_notes: Optional[str] = None) -> bool:
         """Met à jour le statut d'une slice dans le fichier Markdown."""
         if not self.path.exists():
-            return
+            return False
 
         content = self.path.read_text(encoding="utf-8")
 
-        # Remplace le champ Statut
-        def replace_status(m):
-            return f"**Statut** : {status}"
+        # Trouver et remplacer le statut
+        pattern = re.compile(
+            rf"(## Slice\s+{re.escape(slice_id)}\s*:.*?\n)"
+            r"(\*\*Statut\*\*\s*:\s*)\w+",
+            re.MULTILINE
+        )
+        new_content = pattern.sub(rf"\g<1>\g<2>{status}", content)
 
-        def replace_iterations(m):
-            return f"**Itérations** : {iterations}"
+        # Mettre à jour les itérations
+        iter_pattern = re.compile(
+            rf"(## Slice\s+{re.escape(slice_id)}\s*:.*?\n.*?"
+            r"\*\*Itérations\*\*\s*:\s*)\d+",
+            re.MULTILINE | re.DOTALL
+        )
+        new_content = iter_pattern.sub(rf"\g<1>{iterations}", new_content)
 
-        # Cibler uniquement le bloc de la slice concernée
-        # (remplacement simple ligne par ligne dans le bloc)
-        lines = content.split("\n")
-        in_block = False
-        result = []
-        for line in lines:
-            if re.match(rf"^##\s+Slice\s+{re.escape(slice_id)}\s*:", line):
-                in_block = True
-            elif re.match(r"^##\s+Slice\s+", line) and in_block:
-                in_block = False
+        # Mettre à jour les notes Tester si fournies
+        if tester_notes is not None and tester_notes:
+            notes_pattern = re.compile(
+                rf"(## Slice\s+{re.escape(slice_id)}\s*:.*?"
+                r"\*\*Notes Tester\*\*\s*:\s*).*?(?=^##|\Z)",
+                re.MULTILINE | re.DOTALL
+            )
+            new_notes = f"\g<1>{tester_notes}\n"
+            new_content = notes_pattern.sub(new_notes, new_content)
 
-            if in_block:
-                if re.match(r"\*\*Statut\*\*\s*:", line):
-                    line = f"**Statut** : {status}"
-                elif re.match(r"\*\*Itérations\*\*\s*:", line):
-                    line = f"**Itérations** : {iterations}"
-                elif re.match(r"\*\*Notes Tester\*\*\s*:", line) and tester_notes:
-                    line = f"**Notes Tester** : {tester_notes}"
-
-            result.append(line)
-
-        self.path.write_text("\n".join(result), encoding="utf-8")
-        self._load()  # Recharger pour rester en sync
+        if new_content != content:
+            self.path.write_text(new_content, encoding="utf-8")
+            self._load()  # Recharger
+            return True
+        return False
 
 
-# ── TODO.md ───────────────────────────────────────────────────────────────────
+# ── TodoFile ──────────────────────────────────────────────────────────────────
 class TodoFile:
-    """
-    Lecture du TODO.md pour afficher le statut global (haufcode status).
-    Le TODO.md est écrit et mis à jour par l'Architecte.
-    Le runner le lit pour afficher la progression.
-    """
+    """Lecture du fichier TODO.md pour les statistiques de progression."""
+
+    STATUS_RE = re.compile(r"\|\s*S\d+-\w+\s*\|[^|]+\|\s*(\w+)\s*\|")
 
     def __init__(self, project_dir: str = "."):
         self.path = Path(project_dir) / "TODO.md"
 
-    def read_raw(self) -> str:
-        if self.path.exists():
-            return self.path.read_text(encoding="utf-8")
-        return "(TODO.md non encore généré — en attente de l'Architecte)"
-
-    def count_by_status(self) -> dict:
-        """Compte les slices par statut dans TODO.md."""
+    def count_by_status(self) -> dict[str, int]:
+        """Retourne un dict {statut: count} des slices."""
         if not self.path.exists():
             return {}
         content = self.path.read_text(encoding="utf-8")
-        counts: dict = {}
-        for status in ("PASS", "FAIL", "BLOCKED", "IN_PROGRESS", "TODO"):
-            counts[status] = len(re.findall(rf"\b{status}\b", content))
+        counts: dict[str, int] = {}
+        for m in self.STATUS_RE.finditer(content):
+            status = m.group(1).upper()
+            counts[status] = counts.get(status, 0) + 1
         return counts
 
 
-# ── écriture des fichiers produits par l'Architecte ──────────────────────────
-def write_architect_output(content: str, project_dir: str = "."):
+# ── Utilitaires ───────────────────────────────────────────────────────────────
+def has_planning_files(project_dir: str = ".") -> bool:
+    """Vérifie si les fichiers de planification existent."""
+    proj = Path(project_dir)
+    return (proj / "PHASE1.md").exists() or (proj / "TODO.md").exists()
+
+
+def write_architect_output(response: str, project_dir: str = ".") -> list[str]:
     """
-    Parse la réponse de l'Architecte et écrit les fichiers correspondants.
-    Supporte plusieurs formats de réponse :
-
-    Format 1 (préféré, demandé dans le prompt) :
-      === ARCHITECTURE.md ===
-      <contenu>
-      === END ===
-
-    Format 2 (Claude Code CLI écrit souvent ainsi) :
-      **ARCHITECTURE.md**
-      ```markdown
-      <contenu>
+    Écrit les fichiers produits par l'Architecte dans sa réponse.
+    Détecte les blocs markdown de type :
+      **PHASE1.md**
       ```
-
-    Format 3 (blocs de code avec nom de fichier en header) :
-      ```markdown ARCHITECTURE.md
-      <contenu>
+      contenu
       ```
-
-    Fallback : écrit tout dans ARCHITECT_OUTPUT.md et signale l'erreur.
+    Retourne la liste des fichiers écrits.
     """
     proj = Path(project_dir)
     written = []
 
-    # Format 1 : === FILENAME === ... === END ===
-    pattern1 = re.compile(
-        r"===\s*([\w.-]+\.\w+)\s*===\s*\n(.*?)(?:===\s*END\s*===|(?====\s*[\w.-]+\.\w+\s*===))",
+    # Sauvegarder la réponse brute pour debug
+    raw_output = proj / "ARCHITECT_OUTPUT.md"
+    raw_output.write_text(response, encoding="utf-8")
+
+    # Pattern : **NOMFICHIER.ext** suivi d'un bloc ```
+    file_block_re = re.compile(
+        r"\*\*([A-Z0-9_]+\.md)\*\*\s*\n```[^\n]*\n(.*?)```",
         re.DOTALL | re.IGNORECASE
     )
-    matches1 = pattern1.findall(content)
-    if matches1:
-        for filename, file_content in matches1:
-            out_path = proj / filename.strip()
-            out_path.write_text(file_content.strip(), encoding="utf-8")
-            written.append(str(out_path))
-        return written
 
-    # Format 2 : **FILENAME.md** suivi d'un bloc ```...```
-    pattern2 = re.compile(
-        r"\*\*([\w.-]+\.(?:md|json|txt|yml|yaml))\*\*\s*\n```[^\n]*\n(.*?)```",
-        re.DOTALL | re.IGNORECASE
-    )
-    matches2 = pattern2.findall(content)
-    if matches2:
-        for filename, file_content in matches2:
-            out_path = proj / filename.strip()
-            out_path.write_text(file_content.strip(), encoding="utf-8")
-            written.append(str(out_path))
-        return written
+    for m in file_block_re.finditer(response):
+        filename = m.group(1)
+        content = m.group(2)
 
-    # Format 3 : ``` lang FILENAME.md (header de bloc de code avec nom de fichier)
-    pattern3 = re.compile(
-        r"```[a-z]*\s+([\w.-]+\.(?:md|json|txt|yml|yaml))\s*\n(.*?)```",
-        re.DOTALL | re.IGNORECASE
-    )
-    matches3 = pattern3.findall(content)
-    if matches3:
-        for filename, file_content in matches3:
-            out_path = proj / filename.strip()
-            out_path.write_text(file_content.strip(), encoding="utf-8")
-            written.append(str(out_path))
-        return written
+        # Ne garder que les fichiers de planification
+        if not re.match(r"(PHASE\d+|TODO|ARCHITECTURE)\.md", filename, re.IGNORECASE):
+            continue
 
-    # Fallback : aucun format reconnu — sauvegarde brute
-    out = proj / "ARCHITECT_OUTPUT.md"
-    out.write_text(content, encoding="utf-8")
-    return [str(out)]
+        target = proj / filename
+        target.write_text(content.strip(), encoding="utf-8")
+        written.append(filename)
 
-
-def has_planning_files(project_dir: str = ".") -> bool:
-    """Vérifie que l'Architecte a bien produit les fichiers de planification."""
-    proj = Path(project_dir)
-    return (proj / "PHASE1.md").exists() or (proj / "TODO.md").exists()
+    return written
