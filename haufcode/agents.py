@@ -4,11 +4,14 @@ Couche d'abstraction pour appeler les agents IA.
 Supporte : OpenRouter, Anthropic API, OpenAI, Ollama, Claude Code CLI, Autre.
 """
 import json
+import logging
 import os
 import subprocess
 import urllib.error
 import urllib.request
-from typing import Optional
+
+from haufcode.executor import has_actions as _has_actions
+from haufcode.executor import parse_and_execute
 
 
 class AgentClient:
@@ -31,8 +34,6 @@ class AgentClient:
         Si la réponse contient des actions WRITE_FILE/RUN, les exécute
         et renvoie les résultats au modèle pour qu'il puisse itérer.
         """
-        from haufcode.executor import parse_and_execute, has_actions as _has_actions
-
         if self.provider == "claude_code_cli":
             return self._call_claude_code_cli(prompt, system)
 
@@ -50,7 +51,6 @@ class AgentClient:
             # Exécuter les actions et collecter les résultats
             _, execution_report = parse_and_execute(response, project_dir)
 
-            import logging
             logging.getLogger("haufcode").info(
                 f"  ⚙️  Actions exécutées (tour {turn + 1}) :\n{execution_report}"
             )
@@ -155,7 +155,6 @@ class AgentClient:
             content = content.strip()
 
             if finish_reason not in ("stop", "end_turn"):
-                import logging
                 logging.getLogger("haufcode").warning(
                     f"⚠️  [{self.provider}/{self.model}] finish_reason={finish_reason!r} "
                     f"— réponse potentiellement tronquée ({len(content)} chars). "
