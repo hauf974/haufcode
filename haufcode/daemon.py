@@ -131,7 +131,9 @@ def _run_factory(project_dir: str, projet_md_name: str):
     # Configurer git si GitHub activé
     if cfg.github_enabled:
         git_ops.configure_git_identity(project_dir)
-        git_ops.ensure_git_repo(project_dir)
+        if git_ops.ensure_git_repo(project_dir):
+            # Commit initial avec les fichiers existants (PROJET.md, .gitignore)
+            git_ops.initial_commit(project_dir, cfg.github_token, cfg.github_repo)
 
     try:
         runner = Runner(cfg, state, project_dir)

@@ -34,12 +34,21 @@ def ensure_git_repo(project_dir: str = ".") -> bool:
     """Initialise un dépôt git si nécessaire et crée le .gitignore."""
     git_dir = Path(project_dir) / ".git"
     if not git_dir.exists():
-        ok, msg = _run_git(["init"], cwd=project_dir)
+        # Forcer la branche main (compatible GitHub)
+        ok, msg = _run_git(["init", "-b", "main"], cwd=project_dir)
+        if not ok:
+            # Fallback pour les vieilles versions de git sans -b
+            ok, msg = _run_git(["init"], cwd=project_dir)
         if ok:
-            logger.info("Dépôt git initialisé.")
+            logger.info("Dépôt git initialisé (branche main).")
         else:
             logger.error(f"Impossible d'initialiser git : {msg}")
-            return ok
+            return False
+
+    # S'assurer qu'on est sur main (cas repo déjà init sur master)
+    _, branch = _run_git(["branch", "--show-current"], cwd=project_dir)
+    if branch and branch != "main":
+        _run_git(["checkout", "-b", "main"], cwd=project_dir)
 
     _ensure_gitignore(project_dir)
     return True
@@ -93,7 +102,6 @@ def _ensure_gitignore(project_dir: str = "."):
     """Crée ou complète le .gitignore du projet."""
     gitignore_path = Path(project_dir) / ".gitignore"
     if gitignore_path.exists():
-        # Vérifier que .haufcode/ y est bien
         content = gitignore_path.read_text(encoding="utf-8")
         if ".haufcode/" not in content:
             with open(gitignore_path, "a", encoding="utf-8") as f:
@@ -104,6 +112,41 @@ def _ensure_gitignore(project_dir: str = "."):
         logger.info(".gitignore créé.")
 
 
+def initial_commit(project_dir: str = ".", github_token: str = "",
+                   repo: str = "") -> bool:
+    """
+    Crée le commit initial et pousse vers GitHub si token disponible.
+    Appelé une seule fois au démarrage du premier démon.
+    Ne fait rien si des commits existent déjà.
+    """
+    # Vérifier s'il y a déjà des commits
+    ok, _ = _run_git(["log", "--oneline", "-1"], cwd=project_dir)
+    if ok:  # Des commits existent déjà
+        return True
+
+    ok, msg = _run_git(["add", "."], cwd=project_dir)
+    if not ok:
+        logger.error(f"git add initial échoué : {msg}")
+        return False
+
+    ok, status = _run_git(["status", "--porcelain"], cwd=project_dir)
+    if ok and not status:
+        logger.info("Rien à committer pour le commit initial.")
+        return True
+
+    ok, msg = _run_git(["commit", "-m", "Initial commit — HaufCode project setup"],
+                       cwd=project_dir)
+    if not ok:
+        logger.error(f"Commit initial échoué : {msg}")
+        return False
+
+    logger.info("✅  Commit initial créé.")
+
+    if github_token and repo:
+        return push_to_github(github_token, repo, project_dir)
+    return True
+
+
 def commit_slice(phase: int, sprint: int, slice_name: str,
                  project_dir: str = ".") -> bool:
     """
@@ -112,19 +155,16 @@ def commit_slice(phase: int, sprint: int, slice_name: str,
     """
     commit_msg = f"[PHASE{phase}/S{sprint}] Slice: {slice_name} — PASS"
 
-    # git add .
     ok, msg = _run_git(["add", "."], cwd=project_dir)
     if not ok:
         logger.error(f"git add échoué : {msg}")
         return False
 
-    # Vérifier s'il y a des changements à committer
     ok, status = _run_git(["status", "--porcelain"], cwd=project_dir)
     if ok and not status:
         logger.info("Rien à committer pour cette slice.")
         return True
 
-    # git commit
     ok, msg = _run_git(["commit", "-m", commit_msg], cwd=project_dir)
     if ok:
         logger.info(f"✅  Commit : {commit_msg}")
@@ -142,30 +182,25 @@ def push_to_github(github_token: str, repo: str,
     """
     remote_url = f"https://{github_token}@github.com/{repo}.git"
 
-    # Vérifier/configurer le remote origin
     ok, current_remote = _run_git(["remote", "get-url", "origin"], cwd=project_dir)
     if not ok:
-        # Pas de remote : l'ajouter
         ok, msg = _run_git(["remote", "add", "origin", remote_url], cwd=project_dir)
         if not ok:
             logger.error(f"Impossible d'ajouter le remote : {msg}")
             return False
     else:
-        # Mettre à jour l'URL (avec token frais)
         _run_git(["remote", "set-url", "origin", remote_url], cwd=project_dir)
 
-    # Détecter la branche courante
     ok, branch = _run_git(["branch", "--show-current"], cwd=project_dir)
     if not ok or not branch:
         branch = "main"
 
-    # git push
     ok, msg = _run_git(["push", "-u", "origin", branch], cwd=project_dir)
     if ok:
         logger.info(f"✅  Push vers {repo} ({branch})")
         return True
     else:
-        logger.error(f"git push échoué : {msg}")
+        logger.error(f"❌  git push échoué : {msg}")
         return False
 
 
