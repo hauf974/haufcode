@@ -338,6 +338,60 @@ def cmd_logs():
         print()
 
 
+# ── promptarchitect ───────────────────────────────────────────────────────
+DEBUG_PROMPT_MARKER = ".haufcode/architect_prompt.txt"
+
+
+def cmd_prompt_architect():
+    """
+    Envoie un message libre à l'Architecte.
+    L'usine doit être arrêtée. La réponse est injectée au prochain resume.
+    """
+    if _is_factory_running():
+        print("❌  L'usine tourne. Arrêtez-la d'abord avec 'haufcode stop'.")
+        return
+
+    project_dir = _get_last_project_dir()
+    if not project_dir:
+        print("❌  Aucun projet actif.")
+        return
+
+    print()
+    print("─" * 55)
+    print("  HaufCode — Message à l'Architecte")
+    print("─" * 55)
+    print("  L'Architecte recevra ce message au prochain 'haufcode resume'.")
+    print("  Il pourra modifier les fichiers, ajouter des tests, corriger...")
+    print("  (Ctrl+C pour annuler)")
+    print()
+
+    try:
+        lines = []
+        print("  Votre message (ligne vide pour terminer) :")
+        while True:
+            line = input("  > ")
+            if line == "":
+                break
+            lines.append(line)
+
+        if not lines:
+            print("  Aucun message saisi.")
+            return
+
+        message = "\n".join(lines)
+        prompt_file = Path(project_dir) / DEBUG_PROMPT_MARKER
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        prompt_file.write_text(message, encoding="utf-8")
+
+        print()
+        print(f"  ✅  Message enregistré ({len(message)} chars).")
+        print("  Lancez 'haufcode resume' pour l'envoyer à l'Architecte.")
+        print()
+
+    except KeyboardInterrupt:
+        print("\n  Annulé.")
+
+
 # ── changeagents ──────────────────────────────────────────────────────────────
 def cmd_changeagents():
     """Modifie la configuration des agents IA sans réinitialiser le projet."""

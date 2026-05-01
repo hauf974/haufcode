@@ -4,7 +4,6 @@ Listener Telegram — processus séparé, long-polling permanent.
 Survit au stop du démon principal.
 Gère les réponses humaines pour débloquer l'usine.
 """
-import json
 import logging
 import os
 import signal
@@ -15,8 +14,6 @@ from pathlib import Path
 from haufcode.config import (
     GLOBAL_CONFIG_DIR,
     GLOBAL_PID_FILE,
-    PROJECT_TELEGRAM_PID_FILE,
-    GlobalConfig,
     ProjectState,
 )
 from haufcode.telegram_client import TelegramClient
@@ -158,8 +155,14 @@ def _handle_update(client: TelegramClient, update: dict):
     elif text == "logs":
         _cmd_logs(client)
 
+    elif text in ("/promptarchitect", "promptarchitect"):
+        _cmd_prompt_architect_telegram(client)
+
     else:
         # Réponse libre → stockée pour que l'Architecte puisse la lire
+        # Sauf si on attend un prompt architecte
+        if _is_awaiting_architect_prompt(client, text):
+            return
         _store_human_reply(text)
         client.send_message(f"✉️ Réponse enregistrée pour l'Architecte :\n<i>{text}</i>")
 
@@ -221,6 +224,53 @@ def _cmd_stop(client: TelegramClient):
         )
     except Exception as e:
         client.send_message(f"❌ Impossible d'arrêter l'usine : {e}")
+
+
+
+# ── état "en attente prompt architecte" ──────────────────────────────────────
+_AWAITING_ARCHITECT_PROMPT: dict[str, bool] = {}
+
+
+def _cmd_prompt_architect_telegram(client: TelegramClient):
+    """Telegram : active le mode saisie de message pour l'Architecte."""
+    from haufcode.daemon import _is_factory_running, _get_last_project_dir
+    if _is_factory_running():
+        client.send_message("❌ L'usine tourne. Stoppez-la d'abord.")
+        return
+    if not _get_last_project_dir():
+        client.send_message("❌ Aucun projet actif.")
+        return
+    _AWAITING_ARCHITECT_PROMPT["active"] = True
+    client.send_message(
+        "📩 <b>Mode message Architecte</b>\n\n"
+        "Votre prochain message sera envoyé directement à l'Architecte.\n"
+        "Faites 'haufcode resume' après pour l'exécuter."
+    )
+
+
+def _is_awaiting_architect_prompt(client: TelegramClient, text: str) -> bool:
+    """Si on attend un prompt architecte, le stocke et retourne True."""
+    if not _AWAITING_ARCHITECT_PROMPT.get("active"):
+        return False
+
+    _AWAITING_ARCHITECT_PROMPT.clear()
+
+    from haufcode.daemon import _get_last_project_dir, DEBUG_PROMPT_MARKER
+    from pathlib import Path
+    project_dir = _get_last_project_dir()
+    if not project_dir:
+        client.send_message("❌ Aucun projet actif.")
+        return True
+
+    prompt_file = Path(project_dir) / DEBUG_PROMPT_MARKER
+    prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    prompt_file.write_text(text, encoding="utf-8")
+
+    client.send_message(
+        f"✅ Message enregistré pour l'Architecte :\n<i>{text[:200]}</i>\n\n"
+        "Lancez <code>haufcode resume</code> pour l'exécuter."
+    )
+    return True
 
 
 def _store_human_reply(text: str):

@@ -18,7 +18,6 @@ import re
 import subprocess
 from pathlib import Path
 
-
 # ── Patterns de parsing ───────────────────────────────────────────────────────
 _WRITE_FILE_RE = re.compile(
     r'WRITE_FILE:\s*(\S+)\s*\n```[^\n]*\n(.*?)```',

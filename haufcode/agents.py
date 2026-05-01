@@ -155,6 +155,7 @@ class AgentClient:
             content = content.strip()
 
             if finish_reason not in ("stop", "end_turn"):
+                import logging
                 logging.getLogger("haufcode").warning(
                     f"⚠️  [{self.provider}/{self.model}] finish_reason={finish_reason!r} "
                     f"— réponse potentiellement tronquée ({len(content)} chars). "

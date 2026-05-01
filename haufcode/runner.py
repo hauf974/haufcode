@@ -63,6 +63,9 @@ class Runner:
 
         self.log.info("🏭  HaufCode démarré.")
 
+        # Message utilisateur en attente pour l'Architecte ?
+        self._inject_architect_prompt_if_pending()
+
         try:
             # Initialisation si premier lancement
             if self.state.current_role == "ARCHITECT" and self.state.slice_index == 0:
@@ -87,6 +90,9 @@ class Runner:
         except DebugPause:
             # WAITING déjà sauvegardé dans _debug_pause, on ne touche pas au statut
             self.log.info("🐛  Pause debug. Relancez avec 'haufcode resume [--debug]'.")
+
+        except ProjectDone:
+            self._project_done()
 
         except ProjectDone:
             self._project_done()
@@ -549,6 +555,35 @@ class Runner:
         self.telegram.notify_question(question, context=context, log_tail=log_tail)
 
     # ── attente réponse humaine ───────────────────────────────────────────────
+
+    def _inject_architect_prompt_if_pending(self):
+        """
+        Si .haufcode/architect_prompt.txt existe, envoie son contenu
+        à l'Architecte avant de reprendre le pipeline normal.
+        Supprime le fichier après envoi pour éviter toute boucle.
+        """
+        from haufcode.daemon import DEBUG_PROMPT_MARKER
+        prompt_file = Path(self.project_dir) / DEBUG_PROMPT_MARKER
+        if not prompt_file.exists():
+            return
+
+        user_message = prompt_file.read_text(encoding="utf-8").strip()
+        if not user_message:
+            prompt_file.unlink(missing_ok=True)
+            return
+
+        self.log.info(f"📩  Message utilisateur → Architecte ({len(user_message)} chars)")
+        prompt_file.unlink(missing_ok=True)  # Supprimer avant l'appel
+
+        arch_prompt = (
+            f"# Message de l'utilisateur\n\n"
+            f"{user_message}\n\n"
+            "Traite cette demande : utilise WRITE_FILE et RUN si nécessaire, "
+            "puis indique ce que tu as fait.\n"
+            "Termine par NEXT: BUILDER ou NEXT: ARCHITECT selon la suite."
+        )
+        self._call_agent("ARCHITECT", arch_prompt, ARCHITECT_SYSTEM)
+
     def _wait_human_input(self):
         """
         Passe en WAITING. Le listener Telegram stockera la réponse dans

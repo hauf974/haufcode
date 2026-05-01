@@ -38,6 +38,12 @@ COMMANDES
   changeagents          Modifie la configuration des modèles IA sans réinitialiser
                         le projet. Requiert un stop préalable.
 
+  promptarchitect       Envoie un message libre à l'Architecte (l'usine doit être
+                        arrêtée). Permet de demander des corrections, des tests
+                        supplémentaires, ou des ajustements en cours de projet.
+                        Disponible aussi via Telegram : envoyez le message
+                        /promptarchitect puis votre texte au bot.
+
   help                  Affiche ce message.
 
 OPTIONS
@@ -126,6 +132,10 @@ def main():
     elif command == "changeagents":
         from haufcode.daemon import cmd_changeagents
         cmd_changeagents()
+
+    elif command == "promptarchitect":
+        from haufcode.daemon import cmd_prompt_architect
+        cmd_prompt_architect()
 
     else:
         print(f"❌  Commande inconnue : '{command}'\n")
