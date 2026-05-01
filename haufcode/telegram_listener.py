@@ -187,13 +187,14 @@ def _cmd_status(client: TelegramClient):
     """Envoie le statut courant via Telegram."""
     try:
         state = ProjectState()
+        stop_flag = " 🔴 Arrêt demandé" if state.stop_requested else ""
         msg = (
             "📊 <b>Statut HaufCode</b>\n\n"
             f"Phase   : {state.phase}\n"
             f"Sprint  : {state.sprint}\n"
             f"Slice   : {state.slice_index}\n"
             f"Rôle    : {state.current_role}\n"
-            f"Statut  : {state.status}\n"
+            f"Statut  : {state.status}{stop_flag}\n"
             f"Verdict : {state.last_verdict or '—'}\n"
         )
         client.send_message(msg)
@@ -213,7 +214,11 @@ def _cmd_stop(client: TelegramClient):
             stdout=open(os.devnull, "w"),
             stderr=open(os.devnull, "w"),
         )
-        client.send_message("⏹️ Commande <code>stop</code> envoyée. L'usine s'arrêtera après la slice en cours.")
+        client.send_message(
+            "⏹️ Commande <code>stop</code> enregistrée.\n"
+            "L'usine s'arrêtera dès que la tâche en cours sera terminée.\n"
+            "Si un agent réfléchit actuellement, l'arrêt interviendra après sa réponse."
+        )
     except Exception as e:
         client.send_message(f"❌ Impossible d'arrêter l'usine : {e}")
 

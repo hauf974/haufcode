@@ -21,7 +21,7 @@ from haufcode.config import (
 
 
 # ── start ─────────────────────────────────────────────────────────────────────
-def cmd_start(projet_md: str):
+def cmd_start(projet_md: str, debug: bool = False):
     """Lance l'usine en mode démon pour le PROJET.md donné."""
     projet_path = Path(projet_md)
     if not projet_path.exists():
@@ -51,6 +51,12 @@ def cmd_start(projet_md: str):
     # Reset de l'état si premier lancement complet
     if state.status == "IDLE":
         state.reset()
+
+    # Enregistrer le mode debug dans l'état
+    if debug:
+        state.debug_mode = True
+        state.save()
+        print("🐛  Mode debug activé — pause après chaque bascule d'agent.")
 
     print(f"🚀  Démarrage de l'usine pour {projet_md}…")
     _fork_daemon(project_dir, projet_path.name)
@@ -166,7 +172,7 @@ def cmd_stop():
 
 
 # ── resume ────────────────────────────────────────────────────────────────────
-def cmd_resume():
+def cmd_resume(debug: bool = False):
     """Relance l'usine depuis l'état sauvegardé."""
     if _is_factory_running():
         print("ℹ️  L'usine tourne déjà.")
@@ -183,9 +189,13 @@ def cmd_resume():
         print("❌  Aucun projet en cours. Utilisez 'haufcode start <PROJET.md>'.")
         return
 
-    # Réinitialiser stop_requested si présent
+    # Mettre à jour le mode debug (peut changer entre deux resume)
+    state.debug_mode = debug
     state.stop_requested = False
     state.save()
+
+    if debug:
+        print("🐛  Mode debug activé — pause après chaque bascule d'agent.")
 
     # Lire la réponse humaine si disponible
     human_reply_file = Path(project_dir) / ".haufcode/human_reply.txt"
@@ -216,6 +226,8 @@ def cmd_status():
 
     # En-tête statut démon
     running = _is_factory_running()
+    stop_requested = state.stop_requested
+
     status_icon = {
         "RUNNING":  "🟢 En cours",
         "WAITING":  "⏳ En attente (réponse humaine ou resume)",
@@ -223,6 +235,8 @@ def cmd_status():
         "DONE":     "🏁 Terminé",
         "IDLE":     "⚪ Non démarré",
     }.get(state.status, state.status)
+    if running and stop_requested:
+        status_icon = "🔴 Arrêt demandé (en attente fin de tâche en cours)"
 
     print()
     print("─" * 55)

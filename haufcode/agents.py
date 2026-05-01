@@ -4,11 +4,10 @@ Couche d'abstraction pour appeler les agents IA.
 Supporte : OpenRouter, Anthropic API, OpenAI, Ollama, Claude Code CLI, Autre.
 """
 import json
-import os
 import subprocess
-import tempfile
-import urllib.error
 import urllib.request
+import urllib.error
+import os
 from typing import Optional
 
 
@@ -58,7 +57,6 @@ class AgentClient:
                 timeout=1800,  # 30 min max par appel
             )
         except subprocess.TimeoutExpired:
-            # Tuer proprement le processus et ses enfants
             try:
                 os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
             except Exception:
@@ -111,9 +109,22 @@ class AgentClient:
             body = e.read().decode(errors="replace")
             raise RuntimeError(f"HTTP {e.code} depuis {self.provider} : {body}")
 
-        # Extraction de la réponse
+        # Extraction de la réponse avec logging du finish_reason
         try:
-            return result["choices"][0]["message"]["content"].strip()
+            choice = result["choices"][0]
+            finish_reason = choice.get("finish_reason", "unknown")
+            content = choice["message"]["content"].strip()
+
+            # Logger le finish_reason pour détecter les troncatures
+            if finish_reason not in ("stop", "end_turn"):
+                import logging
+                logging.getLogger("haufcode").warning(
+                    f"⚠️  [{self.provider}/{self.model}] finish_reason={finish_reason!r} "
+                    f"— réponse potentiellement tronquée ({len(content)} chars). "
+                    f"usage={result.get('usage', {})}"
+                )
+
+            return content
         except (KeyError, IndexError):
             raise RuntimeError(f"Réponse inattendue de {self.provider} : {result}")
 
