@@ -1,92 +1,53 @@
 """
 HaufCode — agents.py
-Couche d'abstraction pour appeler les agents IA.
-Supporte : OpenRouter, Anthropic API, OpenAI, Ollama, Claude Code CLI, Autre.
+Interface unifiée vers les agents IA.
+Délègue la boucle agentique à tool_caller.AgentExecutor.
 """
-import json
 import logging
 import os
 import subprocess
-import urllib.error
-import urllib.request
 
-from haufcode.executor import has_actions as _has_actions
-from haufcode.executor import parse_and_execute
+from haufcode.tool_caller import AgentExecutor, ExecutionHistory
+
+log = logging.getLogger("haufcode")
 
 
 class AgentClient:
     """
-    Interface unifiée pour appeler un modèle IA quel que soit son provider.
-    La config est un dict issu de ProjectConfig.get_agent(role).
+    Façade utilisée par le Runner.
+    Choisit automatiquement le mode d'exécution (tool_call ou text_parse)
+    selon la configuration de l'agent.
     """
 
     def __init__(self, agent_cfg: dict):
+        self.cfg = agent_cfg
         self.provider = agent_cfg.get("provider", "")
         self.model = agent_cfg.get("model", "")
-        self.api_key = agent_cfg.get("api_key", "")
-        self.base_url = agent_cfg.get("base_url", "")
 
-    def call(self, prompt: str, system: str = "",
-             max_tokens: int = 4096,
-             project_dir: str = ".") -> str:
+    def call(
+        self,
+        prompt: str,
+        system: str = "",
+        max_tokens: int = 4096,
+        project_dir: str = ".",
+        history: ExecutionHistory | None = None,
+    ) -> str:
         """
-        Envoie un prompt à l'agent et retourne la réponse texte.
-        Si la réponse contient des actions WRITE_FILE/RUN, les exécute
-        et renvoie les résultats au modèle pour qu'il puisse itérer.
+        Envoie un prompt à l'agent et retourne la réponse texte finale.
+        Les actions WRITE_FILE/RUN sont exécutées par Python de façon transparente.
         """
         if self.provider == "claude_code_cli":
             return self._call_claude_code_cli(prompt, system)
 
-        # Boucle agent : réponse → exécution → réponse...
-        messages = self._build_messages(prompt, system)
-        MAX_AGENTIC_TURNS = 5
+        executor = AgentExecutor(self.cfg, project_dir, history)
+        return executor.run(prompt, system, max_tokens)
 
-        for turn in range(MAX_AGENTIC_TURNS):
-            response = self._call_openai_compat_messages(messages, max_tokens)
-
-            # Vérifier s'il y a des actions à exécuter
-            if not _has_actions(response):
-                return response  # Réponse finale sans actions
-
-            # Exécuter les actions et collecter les résultats
-            _, execution_report = parse_and_execute(response, project_dir)
-
-            logging.getLogger("haufcode").info(
-                f"  ⚙️  Actions exécutées (tour {turn + 1}) :\n{execution_report}"
-            )
-
-            # Dernier tour : retourner la réponse telle quelle
-            if turn == MAX_AGENTIC_TURNS - 1:
-                return response
-
-            # Vérifier s'il y a des erreurs dans les résultats
-            has_errors = "ERREUR" in execution_report or "TIMEOUT" in execution_report or "EXCEPTION" in execution_report
-            feedback = (
-                f"Résultats d'exécution :\n{execution_report}\n\n"
-            )
-            if has_errors:
-                feedback += (
-                    "⚠️ Des erreurs ont été détectées. Tu DOIS corriger ces erreurs avant de continuer. "
-                    "Analyse chaque ERREUR et écris les corrections avec WRITE_FILE et RUN.\n"
-                    "Ne passe PAS à NEXT: TESTER tant que toutes les commandes ne retournent pas OK (code 0)."
-                )
-            else:
-                feedback += "Continue si nécessaire. Si tout est fait et fonctionne, termine par NEXT: TESTER."
-
-            messages.append({"role": "assistant", "content": response})
-            messages.append({"role": "user", "content": feedback})
-
-        return response
-
-    # ── Claude Code CLI ───────────────────────────────────────────────────────
     def _call_claude_code_cli(self, prompt: str, system: str) -> str:
-        """
-        Appelle Claude Code via son interface CLI.
-        Passe le prompt via stdin pour fiabilité maximale.
-        """
+        """Appelle Claude Code CLI via stdin/stdout."""
+        import signal as _signal
+
         full_prompt = f"{system}\n\n{prompt}" if system else prompt
 
-        import signal as _signal
         proc = subprocess.Popen(
             ["claude", "--print"],
             stdin=subprocess.PIPE,
@@ -95,10 +56,7 @@ class AgentClient:
             text=True,
         )
         try:
-            stdout, stderr = proc.communicate(
-                input=full_prompt,
-                timeout=1800,  # 30 min max par appel
-            )
+            stdout, stderr = proc.communicate(input=full_prompt, timeout=1800)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
@@ -109,85 +67,11 @@ class AgentClient:
 
         if proc.returncode != 0:
             raise RuntimeError(
-                f"Claude Code CLI erreur (code {proc.returncode}) : "
-                f"{stderr.strip()}"
+                f"Claude Code CLI erreur (code {proc.returncode}) : {stderr.strip()}"
             )
         return stdout.strip()
 
-    # ── OpenAI-compatible (OpenRouter, Anthropic, OpenAI, Ollama, Autre) ──────
-    def _build_messages(self, prompt: str, system: str) -> list:
-        """Construit la liste de messages initiale."""
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        return messages
 
-    def _call_openai_compat_messages(self, messages: list,
-                                      max_tokens: int) -> str:
-        """Appelle le provider avec une liste de messages complète."""
-        base_url = self._resolve_base_url()
-        url = f"{base_url}/chat/completions"
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0.2,
-        }
-
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        if self.provider == "openrouter":
-            headers["HTTP-Referer"] = "https://github.com/haufcode"
-            headers["X-Title"] = "HaufCode"
-
-        data = json.dumps(payload).encode()
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                result = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
-            raise RuntimeError(f"HTTP {e.code} depuis {self.provider} : {body}")
-
-        try:
-            choice = result["choices"][0]
-            finish_reason = choice.get("finish_reason", "unknown")
-            content = choice["message"].get("content") or ""
-            content = content.strip()
-
-            if finish_reason not in ("stop", "end_turn"):
-                import logging
-                logging.getLogger("haufcode").warning(
-                    f"⚠️  [{self.provider}/{self.model}] finish_reason={finish_reason!r} "
-                    f"— réponse potentiellement tronquée ({len(content)} chars). "
-                    f"usage={result.get('usage', {})}"
-                )
-
-            return content
-        except (KeyError, IndexError):
-            raise RuntimeError(f"Réponse inattendue de {self.provider} : {result}")
-
-    def _resolve_base_url(self) -> str:
-        """Retourne l'URL de base selon le provider."""
-        urls = {
-            "openrouter":    "https://openrouter.ai/api/v1",
-            "anthropic_api": "https://api.anthropic.com/v1",
-            "openai":        "https://api.openai.com/v1",
-            "ollama":        self.base_url or "http://localhost:11434/v1",
-            "other":         self.base_url,
-        }
-        url = urls.get(self.provider, self.base_url)
-        if not url:
-            raise RuntimeError(f"URL de base inconnue pour provider '{self.provider}'")
-        return url.rstrip("/")
-
-
-# ── factory par rôle ──────────────────────────────────────────────────────────
 def get_agent(role: str, project_cfg) -> AgentClient:
     """Crée un AgentClient pour un rôle donné à partir de la config projet."""
     cfg = project_cfg.get_agent(role)

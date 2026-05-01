@@ -1,151 +1,199 @@
 """
 HaufCode — executor.py
-Parse et exécute les actions déclarées dans les réponses des agents.
+Exécution d'actions (commandes shell, écriture de fichiers) avec annotation intelligente.
 
-Format supporté dans les réponses des modèles :
-
-  WRITE_FILE: chemin/vers/fichier.ext
-  ```
-  contenu du fichier
-  ```
-
-  RUN: commande shell
-
-Python exécute ces actions dans le répertoire du projet,
-puis retourne les résultats au modèle pour qu'il puisse itérer.
+Ce module est la couche basse — il ne sait rien des modèles IA.
+Il reçoit des instructions Python structurées et retourne des résultats annotés.
 """
-import re
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
-# ── Patterns de parsing ───────────────────────────────────────────────────────
-# Format standard : WRITE_FILE: chemin\n```\ncontenu\n```
-_WRITE_FILE_RE = re.compile(
-    r'WRITE_FILE:\s*(\S+)\s*\n```[^\n]*\n(.*?)```',
-    re.DOTALL
-)
-_RUN_RE = re.compile(r'^RUN:\s*(.+)$', re.MULTILINE)
-# RUN: à l'intérieur de blocs ```bash ... ``` (certains modèles utilisent ce format)
-_BASH_BLOCK_RE = re.compile(r'```(?:bash|sh)\s*\n(.*?)```', re.DOTALL)
-# Format alternatif Mistral : WRITE_FILE:\n   Path: chemin\n   Content: |\n     contenu
-_WRITE_FILE_ALT_RE = re.compile(
-    r'WRITE_FILE:\s*\n\s*[Pp]ath:\s*(\S+)\s*\n\s*[Cc]ontent:\s*\|?\s*\n(.*?)(?=\n\s*WRITE_FILE:|\nRUN:|\nNEXT:|\Z)',
-    re.DOTALL
-)
+RUN_TIMEOUT = 120       # secondes max par commande
+MAX_OUTPUT_CHARS = 3000  # tronquer les outputs avant de les renvoyer aux modèles
 
-MAX_OUTPUT_CHARS = 3000   # tronquer les outputs longs avant de les renvoyer
-RUN_TIMEOUT      = 120    # secondes max par commande
+BLOCKED_COMMANDS = ["rm -rf /", ":(){ :|:& };:", "mkfs", "dd if=/dev/zero"]
 
 
-def parse_and_execute(response: str, project_dir: str) -> tuple[bool, str]:
+# ── Résultats typés ───────────────────────────────────────────────────────────
+
+@dataclass
+class CommandResult:
+    """Résultat complet d'une commande shell exécutée."""
+    command: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    annotations: list[str] = field(default_factory=list)
+    timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return not self.timed_out and self.exit_code == 0
+
+    def to_report(self) -> str:
+        """Rapport lisible par un LLM."""
+        lines = [f"▶ RUN: {self.command}"]
+        if self.timed_out:
+            lines.append(f"  → TIMEOUT ({RUN_TIMEOUT}s dépassé)")
+        elif self.ok:
+            out = self.stdout or "(pas de sortie)"
+            if len(out) > MAX_OUTPUT_CHARS:
+                out = out[:MAX_OUTPUT_CHARS] + "\n... [tronqué]"
+            lines.append(f"  → OK (exit_code=0)\n  stdout: {out}")
+        else:
+            err = self.stderr or self.stdout or "(pas de message d'erreur)"
+            if len(err) > MAX_OUTPUT_CHARS:
+                err = err[:MAX_OUTPUT_CHARS] + "\n... [tronqué]"
+            lines.append(f"  → ERREUR (exit_code={self.exit_code})\n  stderr: {err}")
+        for ann in self.annotations:
+            lines.append(f"  ⚠️  {ann}")
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        """Sérialisation JSON pour les tool calls."""
+        return {
+            "command": self.command,
+            "exit_code": self.exit_code,
+            "stdout": self.stdout[:1500],
+            "stderr": self.stderr[:500],
+            "ok": self.ok,
+            "timed_out": self.timed_out,
+            "annotations": self.annotations,
+        }
+
+
+@dataclass
+class WriteResult:
+    """Résultat d'une écriture de fichier."""
+    path: str
+    chars: int
+    ok: bool
+    error: str = ""
+
+    def to_report(self) -> str:
+        if self.ok:
+            return f"✅ WRITE_FILE: {self.path} ({self.chars} chars)"
+        return f"❌ WRITE_FILE échoué: {self.path} → {self.error}"
+
+
+# ── Fonctions d'exécution ─────────────────────────────────────────────────────
+
+def run_command(command: str, project_dir: str) -> CommandResult:
     """
-    Parse une réponse de modèle, exécute les actions WRITE_FILE et RUN.
-
-    Retourne (has_actions, execution_report) :
-      - has_actions   : True si au moins une action a été trouvée
-      - execution_report : résumé des actions exécutées + outputs
+    Exécute une commande shell dans le répertoire du projet.
+    Capture exit_code, stdout, stderr. Ajoute des annotations intelligentes.
     """
     proj = Path(project_dir).resolve()
-    report_lines = []
-    has_actions = False
 
-    # ── WRITE_FILE format standard ────────────────────────────────────────────
-    for match in _WRITE_FILE_RE.finditer(response):
-        has_actions = True
-        rel_path = match.group(1).strip()
-        content  = match.group(2)
-
-        target = (proj / rel_path).resolve()
-        if not str(target).startswith(str(proj)):
-            report_lines.append(f"❌ WRITE_FILE refusé (hors projet) : {rel_path}")
-            continue
-
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            report_lines.append(f"✅ WRITE_FILE : {rel_path} ({len(content)} chars)")
-        except Exception as e:
-            report_lines.append(f"❌ WRITE_FILE échoué : {rel_path} → {e}")
-
-    # ── WRITE_FILE format alternatif (Path: / Content:) ──────────────────────
-    for match in _WRITE_FILE_ALT_RE.finditer(response):
-        has_actions = True
-        rel_path = match.group(1).strip()
-        raw = match.group(2)
-        lines = raw.splitlines()
-        indent = min((len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0)
-        content_str = "\n".join(ln[indent:] if len(ln) >= indent else ln for ln in lines).strip()
-
-        target = (proj / rel_path).resolve()
-        if not str(target).startswith(str(proj)):
-            report_lines.append(f"❌ WRITE_FILE (alt) refusé (hors projet) : {rel_path}")
-            continue
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content_str, encoding="utf-8")
-            report_lines.append(f"✅ WRITE_FILE (alt) : {rel_path} ({len(content_str)} chars)")
-        except Exception as e:
-            report_lines.append(f"❌ WRITE_FILE (alt) échoué : {rel_path} → {e}")
-
-    # ── RUN ───────────────────────────────────────────────────────────────────
-    # Collecter les commandes RUN: standard + celles dans les blocs ```bash
-    run_commands: list = list(_RUN_RE.finditer(response))
-    for bash_match in _BASH_BLOCK_RE.finditer(response):
-        bash_content = bash_match.group(1)
-        for line in bash_content.splitlines():
-            line = line.strip()
-            if line and not line.startswith('#') and not line.startswith('EOF'):
-                class _FakeMatch:
-                    def __init__(self, cmd): self._cmd = cmd
-                    def group(self, n): return self._cmd
-                run_commands.append(_FakeMatch(line))
-
-    for match in run_commands:
-        has_actions = True
-        cmd = match.group(1).strip()
-
-        blocked = ["rm -rf /", ":(){ :|:& };:", "mkfs", "dd if=/dev/zero"]
-        if any(b in cmd for b in blocked):
-            report_lines.append(f"❌ RUN bloqué (dangereux) : {cmd}")
-            continue
-
-        report_lines.append(f"▶ RUN : {cmd}")
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                cwd=str(proj),
-                timeout=RUN_TIMEOUT,
+    for blocked in BLOCKED_COMMANDS:
+        if blocked in command:
+            return CommandResult(
+                command=command,
+                exit_code=1,
+                stdout="",
+                stderr="",
+                annotations=[f"Commande bloquée (sécurité) : contient '{blocked}'"],
             )
-            stdout = result.stdout.strip()
-            stderr = result.stderr.strip()
 
-            if result.returncode == 0:
-                out = stdout or "(pas de sortie)"
-                if len(out) > MAX_OUTPUT_CHARS:
-                    out = out[:MAX_OUTPUT_CHARS] + "\n... [tronqué]"
-                report_lines.append(f"  → OK (code 0)\n  stdout: {out}")
-            else:
-                err = stderr or stdout or "(pas de message)"
-                if len(err) > MAX_OUTPUT_CHARS:
-                    err = err[:MAX_OUTPUT_CHARS] + "\n... [tronqué]"
-                report_lines.append(f"  → ERREUR (code {result.returncode})\n  stderr: {err}")
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            cwd=str(proj),
+            timeout=RUN_TIMEOUT,
+        )
+        cmd_result = CommandResult(
+            command=command,
+            exit_code=result.returncode,
+            stdout=result.stdout.strip(),
+            stderr=result.stderr.strip(),
+        )
+    except subprocess.TimeoutExpired:
+        return CommandResult(
+            command=command,
+            exit_code=-1,
+            stdout="",
+            stderr=f"Timeout après {RUN_TIMEOUT}s",
+            timed_out=True,
+        )
+    except Exception as exc:
+        return CommandResult(
+            command=command,
+            exit_code=-1,
+            stdout="",
+            stderr=str(exc),
+        )
 
-        except subprocess.TimeoutExpired:
-            report_lines.append(f"  → TIMEOUT ({RUN_TIMEOUT}s dépassé)")
-        except Exception as e:
-            report_lines.append(f"  → EXCEPTION : {e}")
-
-    report = "\n".join(report_lines) if report_lines else ""
-    return has_actions, report
+    _annotate(cmd_result)
+    return cmd_result
 
 
-def has_actions(response: str) -> bool:
-    """Retourne True si la réponse contient des actions à exécuter."""
-    return bool(
-        _WRITE_FILE_RE.search(response)
-        or _RUN_RE.search(response)
-        or _BASH_BLOCK_RE.search(response)
-    )
+def write_file(path: str, content: str, project_dir: str) -> WriteResult:
+    """Écrit un fichier dans le projet. Refuse les chemins hors projet."""
+    proj = Path(project_dir).resolve()
+    target = (proj / path).resolve()
+
+    if not str(target).startswith(str(proj)):
+        return WriteResult(path=path, chars=0, ok=False,
+                           error="Chemin hors répertoire projet refusé")
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return WriteResult(path=path, chars=len(content), ok=True)
+    except Exception as exc:
+        return WriteResult(path=path, chars=0, ok=False, error=str(exc))
+
+
+# ── Annotations intelligentes ─────────────────────────────────────────────────
+
+def _annotate(result: CommandResult) -> None:
+    """Enrichit le résultat avec des annotations contextuelles."""
+    cmd_lower = result.command.lower()
+    combined = (result.stdout + "\n" + result.stderr).lower()
+
+    # Docker Compose : état anormal même avec exit_code=0
+    if "docker" in cmd_lower and result.ok:
+        if "restarting" in result.stdout:
+            result.annotations.append(
+                "Un container est en état 'restarting' — ce n'est PAS un état sain. "
+                "Exécute 'docker compose logs' pour voir l'erreur de démarrage."
+            )
+            # Forcer exit_code non-zéro pour que la boucle détecte l'échec
+            result.exit_code = 1
+        if " exit" in result.stdout.lower() and "up" not in result.stdout.lower():
+            result.annotations.append(
+                "Un container est en état 'exited' — il a crashé. "
+                "Exécute 'docker compose logs' pour diagnostiquer."
+            )
+            result.exit_code = 1
+
+    # Module natif Node.js incompatible
+    if "err_dlopen_failed" in combined or "symbol not found" in combined:
+        result.annotations.append(
+            "Erreur de module natif Node.js incompatible avec l'OS du container. "
+            "Probable problème Alpine vs Debian. Utilise 'node:20-slim' au lieu de 'node:20-alpine'."
+        )
+
+    # Module Node.js introuvable
+    if ("cannot find module" in combined or "module not found" in combined) and "node" in cmd_lower:
+        result.annotations.append(
+            "Module Node.js introuvable — exécute 'npm install' ou vérifie le nom du module."
+        )
+
+    # Port déjà utilisé
+    if "eaddrinuse" in combined or "address already in use" in combined:
+        result.annotations.append(
+            "Port déjà utilisé par un autre processus. "
+            "Libère-le avec 'fuser -k PORT/tcp' ou 'docker compose down'."
+        )
+
+    # Tests échoués
+    if result.exit_code != 0 and ("test" in cmd_lower or "jest" in cmd_lower):
+        result.annotations.append(
+            "Des tests ont échoué. Analyse les lignes 'FAIL' ou 'Error' ci-dessus "
+            "et corrige le code avant de continuer."
+        )

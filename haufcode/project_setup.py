@@ -419,18 +419,38 @@ def _check_claude_code_cli():
 
 # ── test de connectivité ──────────────────────────────────────────────────────
 def _test_agent(agent_cfg: dict) -> tuple[bool, str]:
+    """
+    Teste la connectivité et détecte le support du function calling.
+    Met à jour agent_cfg["supports_tool_calls"] en place.
+    """
     from haufcode.agents import AgentClient
+    from haufcode.tool_caller import detect_tool_call_support
     try:
         client = AgentClient(agent_cfg)
         response = client.call("Reply with exactly: OK", max_tokens=10)
         if response is None:
             return False, "Réponse None reçue (modèle inaccessible ou format inattendu)"
         response = str(response).strip()
-        if "OK" in response.upper() or len(response) > 0:
-            return True, f"Réponse reçue : {response[:50]}"
-        return True, f"Réponse : {response[:80]}"
-    except Exception as e:
-        return False, str(e)
+        if not ("OK" in response.upper() or len(response) > 0):
+            return False, f"Réponse inattendue : {response[:80]}"
+    except Exception as exc:
+        return False, str(exc)
+
+    # Détecter le support function calling
+    if agent_cfg.get("provider") != "claude_code_cli":
+        print("  🔍  Détection function calling…", end=" ", flush=True)
+        try:
+            supports = detect_tool_call_support(agent_cfg)
+            agent_cfg["supports_tool_calls"] = supports
+            mode = "✅ tool_call natif" if supports else "📝 text_parse (1 action/tour)"
+            print(mode)
+        except Exception as exc:
+            agent_cfg["supports_tool_calls"] = False
+            print(f"erreur ({exc}) — mode text_parse utilisé")
+    else:
+        agent_cfg["supports_tool_calls"] = False
+
+    return True, f"Réponse reçue : {response[:50]}"
 
 
 # ── configuration GitHub ──────────────────────────────────────────────────────

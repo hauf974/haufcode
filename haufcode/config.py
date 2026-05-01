@@ -3,7 +3,6 @@ HaufCode — config.py
 Gestion de la configuration globale (~/.haufcode/) et par projet (.haufcode/).
 """
 import json
-import os
 from pathlib import Path
 from typing import Optional
 
@@ -70,7 +69,7 @@ class GlobalConfig:
 class ProjectConfig:
     """
     Configuration d'un projet (.haufcode/config.json dans le répertoire projet).
-    Contient : agents IA (provider, model, api_key), GitHub token/repo.
+    Contient : agents IA (provider, model, api_key, supports_tool_calls), GitHub.
     """
 
     def __init__(self, project_dir: Optional[str] = None):
@@ -92,8 +91,20 @@ class ProjectConfig:
     def get_agent(self, role: str) -> dict:
         return self._data.get("agents", {}).get(role, {})
 
-    def set_agent(self, role: str, provider: str, model: str,
-                  api_key: str = "", base_url: str = ""):
+    def set_agent(
+        self,
+        role: str,
+        provider: str,
+        model: str,
+        api_key: str = "",
+        base_url: str = "",
+        supports_tool_calls: bool = False,
+    ):
+        """
+        Configure un agent pour un rôle.
+        supports_tool_calls est détecté automatiquement lors de la configuration
+        (via tool_caller.detect_tool_call_support) et stocké ici.
+        """
         if "agents" not in self._data:
             self._data["agents"] = {}
         self._data["agents"][role] = {
@@ -101,6 +112,7 @@ class ProjectConfig:
             "model": model,
             "api_key": api_key,
             "base_url": base_url,
+            "supports_tool_calls": supports_tool_calls,
         }
 
     @property
@@ -144,9 +156,7 @@ class ProjectState:
         if self._path.exists():
             with open(self._path) as f:
                 loaded = json.load(f)
-            # Fusionner : _default() fournit les valeurs manquantes,
-            # loaded écrase uniquement les clés qu'il contient.
-            # Ordre important : default d'abord, loaded ensuite.
+            # Fusionner : _default() fournit les valeurs manquantes
             self._data = {**self._default(), **loaded}
 
     @staticmethod

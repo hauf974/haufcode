@@ -15,13 +15,12 @@ from haufcode.metrics import record as record_metric
 from haufcode.planning import PhaseFile, Slice, write_architect_output
 from haufcode.prompts import (
     ARCHITECT_INIT_PROMPT,
-    ARCHITECT_SYSTEM,
-    BUILDER_SYSTEM,
     PHASE_REVIEW_PROMPT,
     SPRINT_REVIEW_PROMPT,
-    TESTER_SYSTEM,
+    get_system_prompt,
 )
 from haufcode.telegram_client import TelegramClient
+from haufcode.tool_caller import ExecutionHistory
 
 MAX_ITERATIONS = 5  # Itérations Builder→Tester avant escalade à l'Architecte
 
@@ -32,8 +31,12 @@ class Runner:
     Instancié par le démon, tourne jusqu'à DONE ou interruption.
     """
 
-    def __init__(self, project_cfg: ProjectConfig, state: ProjectState,
-                 project_dir: str = "."):
+    def __init__(
+        self,
+        project_cfg: ProjectConfig,
+        state: ProjectState,
+        project_dir: str = ".",
+    ):
         self.cfg = project_cfg
         self.state = state
         self.project_dir = project_dir
@@ -41,6 +44,10 @@ class Runner:
         self._agents: dict[str, AgentClient] = {}
         gcfg = GlobalConfig()
         self.telegram = TelegramClient(gcfg.telegram_token, gcfg.telegram_chat_id)
+        # Historique d'exécution courant (réinitialisé à chaque slice)
+        self._exec_history: ExecutionHistory | None = None
+
+    # ── Accès aux agents ──────────────────────────────────────────────────────
 
     def _agent(self, role: str) -> AgentClient:
         if role not in self._agents:
@@ -49,6 +56,15 @@ class Runner:
 
     def _agent_name(self, role: str) -> str:
         return self.cfg.get_agent(role).get("model", role)
+
+    def _agent_supports_tools(self, role: str) -> bool:
+        return bool(self.cfg.get_agent(role).get("supports_tool_calls", False))
+
+    def _system(self, role: str) -> str:
+        """Retourne le prompt système adapté au mode de l'agent."""
+        return get_system_prompt(role, self._agent_supports_tools(role))
+
+    # ── Boucle principale ─────────────────────────────────────────────────────
 
     def run(self):
         """Lance ou reprend la boucle principale."""
@@ -73,7 +89,7 @@ class Runner:
             self.state.save()
 
         except HumanInputNeeded:
-            self.log.info("⏳  Usine en WAITING — reprenez avec 'haufcode resume' après avoir répondu.")
+            self.log.info("⏳  Usine en WAITING — reprenez avec 'haufcode resume'.")
 
         except DebugPause:
             self.log.info("🐛  Pause debug. Relancez avec 'haufcode resume [--debug]'.")
@@ -81,29 +97,32 @@ class Runner:
         except ProjectDone:
             self._project_done()
 
-        except AutoInterruption as e:
-            self.log.error(f"⚠️  Interruption automatique : {e}")
+        except AutoInterruption as exc:
+            self.log.error(f"⚠️  Interruption automatique : {exc}")
             self.state.status = "WAITING"
             self.state.save()
             self.telegram.notify_interruption(
-                str(e), self.state.phase, self.state.sprint,
-                f"slice-{self.state.slice_index}"
+                str(exc), self.state.phase, self.state.sprint,
+                f"slice-{self.state.slice_index}",
             )
 
-        except Exception as e:
-            self.log.error(f"❌  Erreur inattendue : {e}", exc_info=True)
+        except Exception as exc:
+            self.log.error(f"❌  Erreur inattendue : {exc}", exc_info=True)
             self.state.status = "WAITING"
             self.state.save()
             self.telegram.notify_interruption(
-                f"Erreur inattendue : {e}",
+                f"Erreur inattendue : {exc}",
                 self.state.phase, self.state.sprint,
-                f"slice-{self.state.slice_index}"
+                f"slice-{self.state.slice_index}",
             )
+
+    # ── Initialisation de l'Architecte ────────────────────────────────────────
 
     def _architect_init(self) -> bool:
         from haufcode.planning import has_planning_files
+
         if has_planning_files(self.project_dir):
-            self.log.info("📁  Fichiers de planification déjà présents — init Architecte skippée.")
+            self.log.info("📁  Fichiers de planification déjà présents — init skippée.")
             return True
 
         self.log.info("🏗️  Architecte — Planification initiale…")
@@ -115,7 +134,7 @@ class Runner:
         prompt = ARCHITECT_INIT_PROMPT.format(projet_md_content=projet_content)
 
         t0 = time.time()
-        response = self._call_agent("ARCHITECT", prompt, ARCHITECT_SYSTEM)
+        response = self._call_agent("ARCHITECT", prompt)
         duration = time.time() - t0
 
         if "HUMAN_INPUT_NEEDED:" in response:
@@ -130,12 +149,12 @@ class Runner:
         written = write_architect_output(response, self.project_dir)
         self.log.info(f"📁  Fichiers écrits : {', '.join(written)}")
 
-        from haufcode.planning import has_planning_files
-        if not has_planning_files(self.project_dir):
-            self.log.error("❌  Aucun fichier de planification trouvé après init Architecte.")
+        from haufcode.planning import has_planning_files as _hpf
+        if not _hpf(self.project_dir):
+            self.log.error("❌  Aucun fichier de planification après init Architecte.")
             self.telegram.notify_interruption(
                 "L'Architecte n'a pas pu écrire les fichiers de planification.",
-                self.state.phase, self.state.sprint, "init-planning"
+                self.state.phase, self.state.sprint, "init-planning",
             )
             self.state.status = "WAITING"
             self.state.save()
@@ -144,9 +163,11 @@ class Runner:
         record_metric(
             phase=self.state.phase, sprint=self.state.sprint,
             role="ARCHITECT", agent_name=self._agent_name("ARCHITECT"),
-            slice_name="init-planning", duration_s=duration, statut="PASS"
+            slice_name="init-planning", duration_s=duration, statut="PASS",
         )
         return True
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _main_loop(self):
         """Itère sur toutes les phases, sprints et slices jusqu'à DONE."""
@@ -160,24 +181,21 @@ class Runner:
                     self.state.status = "WAITING"
                     self.state.save()
                     raise StopRequested()
-                else:
-                    self.log.info(f"🏁  Phase {phase_num} non trouvée → toutes les phases terminées.")
-                    self._project_done()
-                    return
+                self.log.info(f"🏁  Phase {phase_num} non trouvée → fin des phases.")
+                self._project_done()
+                return
 
             slices = phase_file.get_all_slices()
             if not slices:
                 self.log.error(
-                    f"❌  PHASE{phase_num}.md existe mais ne contient aucune slice reconnue. "
-                    f"Vérifiez le format des en-têtes (## Slice Sx-y : Nom). "
-                    f"Arrêt pour éviter de déclarer la phase terminée à tort."
+                    f"❌  PHASE{phase_num}.md ne contient aucune slice parseable. "
+                    "Vérifiez le format (## Slice Sx-y : Nom)."
                 )
                 raise AutoInterruption(
-                    f"PHASE{phase_num}.md ne contient aucune slice parseable. "
-                    f"Vérifiez le format du fichier."
+                    f"PHASE{phase_num}.md ne contient aucune slice parseable."
                 )
 
-            sprints = sorted(set(sl.sprint for sl in slices))
+            sprints = sorted({sl.sprint for sl in slices})
             for sprint_num in sprints:
                 if sprint_num < self.state.sprint and phase_num == self.state.phase:
                     continue
@@ -202,8 +220,15 @@ class Runner:
             self.state.slice_index = 0
             self.state.save()
 
-    def _process_sprint(self, phase: int, sprint: int,
-                         slices: list[Slice], phase_file: PhaseFile):
+    # ── Traitement d'un sprint ────────────────────────────────────────────────
+
+    def _process_sprint(
+        self,
+        phase: int,
+        sprint: int,
+        slices: list[Slice],
+        phase_file: PhaseFile,
+    ):
         for sl in slices:
             if sl.index < self.state.slice_index:
                 continue
@@ -212,7 +237,11 @@ class Runner:
             self._check_stop_requested()
             self.state.slice_index = sl.index
             self.state.save()
+            # Initialiser l'historique d'exécution pour cette slice
+            self._exec_history = ExecutionHistory(slice_id=sl.id)
             self._process_slice(sl, phase_file)
+
+    # ── Traitement d'une slice ────────────────────────────────────────────────
 
     def _process_slice(self, sl: Slice, phase_file: PhaseFile):
         hlog.log_slice_start(sl.phase, sl.sprint, sl.index, sl.name)
@@ -224,24 +253,25 @@ class Runner:
             iterations += 1
             t0 = time.time()
 
+            # ── Builder ou Architecte (rescue) ────────────────────────────────
             if iterations <= MAX_ITERATIONS:
                 self.state.current_role = "BUILDER"
                 self.state.save()
 
                 builder_prompt = self._build_builder_prompt(sl, tester_notes, iterations)
-                builder_response = self._call_agent("BUILDER", builder_prompt, BUILDER_SYSTEM)
+                builder_response = self._call_agent(
+                    "BUILDER", builder_prompt, history=self._exec_history
+                )
                 duration_builder = time.time() - t0
 
-                if len(builder_response.strip()) < 200:
+                if len(builder_response.strip()) < 100:
                     self.log.warning(
-                        f"⚠️  Builder réponse tronquée ({len(builder_response)} chars) — "
-                        f"relance. Réponse : {repr(builder_response[:80])}"
+                        f"⚠️  Builder réponse tronquée ({len(builder_response)} chars) — relance."
                     )
                     record_metric(
                         phase=sl.phase, sprint=sl.sprint,
                         role="BUILDER", agent_name=self._agent_name("BUILDER"),
-                        slice_name=sl.name, duration_s=duration_builder,
-                        statut="TRUNCATED"
+                        slice_name=sl.name, duration_s=duration_builder, statut="TRUNCATED",
                     )
                     phase_file.update_slice_status(sl.id, "IN_PROGRESS", iterations)
                     continue
@@ -249,32 +279,36 @@ class Runner:
                 record_metric(
                     phase=sl.phase, sprint=sl.sprint,
                     role="BUILDER", agent_name=self._agent_name("BUILDER"),
-                    slice_name=sl.name, duration_s=duration_builder,
-                    statut="RUNNING"
+                    slice_name=sl.name, duration_s=duration_builder, statut="RUNNING",
                 )
                 phase_file.update_slice_status(sl.id, "IN_PROGRESS", iterations)
 
             else:
-                self.log.info(f"🏗️  Escalade Architecte pour '{sl.name}' (>{MAX_ITERATIONS} itérations)")
+                self.log.info(
+                    f"🏗️  Escalade Architecte pour '{sl.name}' (>{MAX_ITERATIONS} itérations)"
+                )
                 self.state.current_role = "ARCHITECT"
                 self.state.save()
 
                 arch_prompt = self._build_architect_rescue_prompt(sl, tester_notes)
-                self._call_agent("ARCHITECT", arch_prompt, ARCHITECT_SYSTEM)
+                self._call_agent("ARCHITECT", arch_prompt, history=self._exec_history)
                 duration_arch = time.time() - t0
 
                 record_metric(
                     phase=sl.phase, sprint=sl.sprint,
                     role="ARCHITECT", agent_name=self._agent_name("ARCHITECT"),
-                    slice_name=sl.name, duration_s=duration_arch, statut="RESCUE"
+                    slice_name=sl.name, duration_s=duration_arch, statut="RESCUE",
                 )
 
+            # ── Tester ────────────────────────────────────────────────────────
             self.state.current_role = "TESTER"
             self.state.save()
 
             t1 = time.time()
             tester_prompt = self._build_tester_prompt(sl)
-            tester_response = self._call_agent("TESTER", tester_prompt, TESTER_SYSTEM)
+            tester_response = self._call_agent(
+                "TESTER", tester_prompt, history=self._exec_history
+            )
             duration_tester = time.time() - t1
 
             verdict = self._extract_verdict(tester_response)
@@ -290,7 +324,7 @@ class Runner:
                 record_metric(
                     phase=sl.phase, sprint=sl.sprint,
                     role="TESTER", agent_name=self._agent_name("TESTER"),
-                    slice_name=sl.name, duration_s=duration_tester, statut="PASS"
+                    slice_name=sl.name, duration_s=duration_tester, statut="PASS",
                 )
                 hlog.log_slice_end(sl.name, "PASS", iterations, total_duration)
                 self.telegram.notify_pass(sl.phase, sl.sprint, sl.name)
@@ -299,39 +333,40 @@ class Runner:
                 self.state.save()
                 return
 
-            elif verdict == "BLOCKED":
+            if verdict == "BLOCKED":
                 phase_file.update_slice_status(sl.id, "BLOCKED", iterations, tester_notes)
                 record_metric(
                     phase=sl.phase, sprint=sl.sprint,
                     role="TESTER", agent_name=self._agent_name("TESTER"),
-                    slice_name=sl.name, duration_s=duration_tester, statut="BLOCKED"
+                    slice_name=sl.name, duration_s=duration_tester, statut="BLOCKED",
                 )
                 hlog.log_slice_end(sl.name, "BLOCKED", iterations, total_duration)
                 self.telegram.notify_blocked(sl.phase, sl.sprint, sl.name, tester_notes)
                 self._handle_blocked(sl, tester_notes, phase_file)
                 return
 
-            else:  # FAIL
-                phase_file.update_slice_status(sl.id, "FAIL", iterations, tester_notes)
-                record_metric(
-                    phase=sl.phase, sprint=sl.sprint,
-                    role="TESTER", agent_name=self._agent_name("TESTER"),
-                    slice_name=sl.name, duration_s=duration_tester, statut="FAIL"
-                )
-                hlog.log_transition("TESTER", "BUILDER", "FAIL")
-                if iterations >= MAX_ITERATIONS:
-                    self.log.info(f"⚠️  {MAX_ITERATIONS} itérations atteintes pour '{sl.name}'")
+            # FAIL
+            phase_file.update_slice_status(sl.id, "FAIL", iterations, tester_notes)
+            record_metric(
+                phase=sl.phase, sprint=sl.sprint,
+                role="TESTER", agent_name=self._agent_name("TESTER"),
+                slice_name=sl.name, duration_s=duration_tester, statut="FAIL",
+            )
+            hlog.log_transition("TESTER", "BUILDER", "FAIL")
+            if iterations >= MAX_ITERATIONS:
+                self.log.info(f"⚠️  {MAX_ITERATIONS} itérations atteintes pour '{sl.name}'")
+
+    # ── Revues ────────────────────────────────────────────────────────────────
 
     def _sprint_review(self, phase: int, sprint: int):
         self.log.info(f"🔍  Revue Sprint {sprint} (Phase {phase})…")
         prompt = SPRINT_REVIEW_PROMPT.format(phase=phase, sprint=sprint)
-        self._call_agent("ARCHITECT", prompt, ARCHITECT_SYSTEM)
+        self._call_agent("ARCHITECT", prompt)
 
     def _phase_review(self, phase: int):
-        """Demande à l'Architecte de vérifier la cohérence de la phase."""
+        """Vérifie que toutes les slices sont PASS puis appelle l'Architecte."""
         self.log.info(f"🔍  Revue Phase {phase}…")
 
-        # Vérifier que TOUTES les slices sont réellement PASS avant la revue
         phase_file_check = PhaseFile(phase, self.project_dir)
         slices_check = phase_file_check.get_all_slices()
         non_pass = [sl for sl in slices_check if sl.status != "PASS"]
@@ -339,18 +374,16 @@ class Runner:
             names = ", ".join(sl.name for sl in non_pass[:3])
             self.log.error(
                 f"❌  Revue Phase {phase} avorée : {len(non_pass)} slice(s) non-PASS "
-                f"({names}). Impossible de déclarer la phase terminée."
+                f"({names})."
             )
             raise AutoInterruption(
                 f"Phase {phase} incomplète : {len(non_pass)} slice(s) non-PASS "
                 f"({names}). Vérifiez PHASE{phase}.md."
             )
 
-        # La phase suivante existe-t-elle ?
         next_exists = PhaseFile(phase + 1, self.project_dir).path.exists()
-
         prompt = PHASE_REVIEW_PROMPT.format(phase=phase)
-        response = self._call_agent("ARCHITECT", prompt, ARCHITECT_SYSTEM)
+        response = self._call_agent("ARCHITECT", prompt)
 
         if "NEXT: DONE" in response:
             if next_exists:
@@ -360,40 +393,52 @@ class Runner:
             else:
                 raise ProjectDone()
 
+    # ── Fin de projet ─────────────────────────────────────────────────────────
+
     def _project_done(self):
         self.log.info("🏁  Projet terminé !")
         self.state.status = "DONE"
         self.state.save()
         self.telegram.notify_project_done()
 
+    # ── Gestion des blocages ──────────────────────────────────────────────────
+
     def _handle_blocked(self, sl: Slice, notes: str, phase_file: PhaseFile):
         self.state.current_role = "ARCHITECT"
         self.state.save()
         arch_prompt = self._build_architect_blocked_prompt(sl, notes)
-        response = self._call_agent("ARCHITECT", arch_prompt, ARCHITECT_SYSTEM)
+        response = self._call_agent("ARCHITECT", arch_prompt, history=self._exec_history)
         if "HUMAN_INPUT_NEEDED:" in response:
             question = self._extract_human_question(response)
             self._notify_human_needed(question, context=f"BLOCKED sur {sl.name}")
             self._wait_human_input()
 
-    def _call_agent(self, role: str, prompt: str, system: str) -> str:
+    # ── Appel agent ───────────────────────────────────────────────────────────
+
+    def _call_agent(
+        self,
+        role: str,
+        prompt: str,
+        history: ExecutionHistory | None = None,
+    ) -> str:
+        """Appelle un agent, gère le heartbeat et le stop."""
         import threading
         import time as _time
 
+        system = self._system(role)
         hlog.log_prompt(role, prompt)
         self.log.info(f"⏳  [{role}] Appel en cours…")
 
-        _stop_heartbeat = threading.Event()
+        _stop_evt = threading.Event()
 
         def _heartbeat():
             elapsed = 0
-            while not _stop_heartbeat.wait(30):
+            while not _stop_evt.wait(30):
                 elapsed += 30
                 self.log.info(f"⏳  [{role}] Toujours en cours… ({elapsed}s)")
-                # Vérifier stop_requested pendant les longs appels
                 fresh = ProjectState(self.project_dir)
                 if fresh.stop_requested:
-                    _stop_heartbeat.set()  # Signal pour sortir de la boucle
+                    _stop_evt.set()
 
         hb = threading.Thread(target=_heartbeat, daemon=True)
         hb.start()
@@ -401,22 +446,30 @@ class Runner:
         t0 = _time.time()
         try:
             agent = self._agent(role)
-            response = agent.call(prompt, system=system,
-                                  project_dir=self.project_dir)
+            response = agent.call(
+                prompt,
+                system=system,
+                project_dir=self.project_dir,
+                history=history,
+            )
             elapsed = int(_time.time() - t0)
-            self.log.info(f"✅  [{role}] Réponse reçue ({elapsed}s, {len(response)} chars)")
+            self.log.info(
+                f"✅  [{role}] Réponse reçue ({elapsed}s, {len(response)} chars)"
+            )
             hlog.log_response(role, response)
-        except Exception as e:
-            hlog.log_error(f"Erreur agent {role}", e)
-            raise AutoInterruption(f"Erreur API {role} : {e}")
+        except Exception as exc:
+            hlog.log_error(f"Erreur agent {role}", exc)
+            raise AutoInterruption(f"Erreur API {role} : {exc}") from exc
         finally:
-            _stop_heartbeat.set()
+            _stop_evt.set()
 
-        # Vérifier stop après chaque appel agent (pas seulement entre slices)
+        # Vérifier le stop après chaque appel (pas seulement entre slices)
         self._check_stop_requested()
 
         self._debug_pause(role, response)
         return response
+
+    # ── Debug pause ───────────────────────────────────────────────────────────
 
     def _debug_pause(self, role: str, response: str):
         fresh = ProjectState(self.project_dir)
@@ -439,6 +492,8 @@ class Runner:
         self.state.save()
         raise DebugPause()
 
+    # ── Commit auto ───────────────────────────────────────────────────────────
+
     def _auto_commit(self, sl: Slice):
         if not self.cfg.github_enabled:
             return
@@ -447,17 +502,19 @@ class Runner:
             self.cfg.github_token, self.cfg.github_repo, self.project_dir
         )
 
+    # ── Vérification stop ─────────────────────────────────────────────────────
+
     def _check_stop_requested(self):
         fresh = ProjectState(self.project_dir)
         if fresh.stop_requested:
             raise StopRequested()
 
+    # ── Inject prompt Architecte ──────────────────────────────────────────────
+
     def _inject_architect_prompt_if_pending(self):
-        """
-        Si .haufcode/architect_prompt.txt existe, envoie son contenu
-        à l'Architecte avant de reprendre le pipeline normal.
-        """
+        """Si .haufcode/architect_prompt.txt existe, l'envoie à l'Architecte."""
         from haufcode.daemon import DEBUG_PROMPT_MARKER
+
         prompt_file = Path(self.project_dir) / DEBUG_PROMPT_MARKER
         if not prompt_file.exists():
             return
@@ -473,23 +530,23 @@ class Runner:
         arch_prompt = (
             f"# Message de l'utilisateur\n\n"
             f"{user_message}\n\n"
-            "Traite cette demande en utilisant WRITE_FILE et RUN.\n"
-            "IMPORTANT : n'invente JAMAIS les résultats des commandes RUN. "
-            "Python exécutera réellement tes commandes et te retournera les vrais outputs. "
-            "Si tu n'utilises pas le format RUN:, aucune commande ne sera exécutée.\n"
+            "Traite cette demande. Utilise les tools disponibles pour agir. "
+            "N'invente JAMAIS les résultats des commandes — Python les exécute réellement. "
             "Termine par NEXT: BUILDER ou NEXT: ARCHITECT selon la suite."
         )
-        self._call_agent("ARCHITECT", arch_prompt, ARCHITECT_SYSTEM)
+        self._call_agent("ARCHITECT", arch_prompt)
+
+    # ── Notifications humaines ────────────────────────────────────────────────
 
     def _notify_human_needed(self, question: str, context: str = ""):
         from haufcode.logger import get_latest_log_file
+
         log_tail = ""
         try:
             log_file = get_latest_log_file()
             if log_file and log_file.exists():
                 lines = log_file.read_text(encoding="utf-8").splitlines()
-                last_lines = lines[-20:] if len(lines) > 20 else lines
-                log_tail = "\n".join(last_lines)
+                log_tail = "\n".join(lines[-20:] if len(lines) > 20 else lines)
         except Exception:
             log_tail = "(logs non disponibles)"
         self.telegram.notify_question(question, context=context, log_tail=log_tail)
@@ -500,34 +557,47 @@ class Runner:
         self.log.info("⏳  En attente d'une réponse humaine via Telegram…")
         raise HumanInputNeeded()
 
-    def _build_builder_prompt(self, sl: Slice, tester_notes: str, iteration: int) -> str:
+    # ── Construction des prompts ──────────────────────────────────────────────
+
+    def _build_builder_prompt(
+        self, sl: Slice, tester_notes: str, iteration: int
+    ) -> str:
         arch_md = self._read_file("ARCHITECTURE.md")
+        history_ctx = self._exec_history.to_context() if self._exec_history else ""
+
         prompt = (
             f"# Tâche Builder — Itération {iteration}\n\n"
             f"## Slice à implémenter\n{sl.raw_block}\n\n"
             f"## Architecture du projet\n{arch_md}\n"
         )
+        if history_ctx:
+            prompt += f"\n{history_ctx}\n"
         if tester_notes:
             prompt += f"\n## Remarques du Tester (itération précédente)\n{tester_notes}\n"
         prompt += (
-            "\n## Instructions"
-            "\nÉcris le code complet pour satisfaire les critères d'acceptation. "
-            "Crée ou modifie les fichiers nécessaires. "
-            "Indique clairement chaque fichier créé/modifié et son contenu complet."
+            "\n## Instructions\n"
+            "Implémente le code pour satisfaire les critères d'acceptation. "
+            "Vérifie que tout fonctionne avant de terminer."
         )
         return prompt
 
     def _build_tester_prompt(self, sl: Slice) -> str:
         phase_md = self._read_file(f"PHASE{sl.phase}.md")
         code_context = self._collect_project_files(sl)
+        history_ctx = self._exec_history.to_context() if self._exec_history else ""
+
         prompt = (
             f"# Tâche Tester\n\n"
             f"## Slice à vérifier\n{sl.raw_block}\n\n"
+        )
+        if history_ctx:
+            prompt += f"{history_ctx}\n\n"
+        prompt += (
             f"## Contexte de la phase\n{phase_md}\n\n"
             f"## Code implémenté par le Builder\n{code_context}\n\n"
-            "Inspecte le code ci-dessus et rends ton verdict (PASS/FAIL/BLOCKED).\n"
-            "BLOCKED ne doit être utilisé que si le code est structurellement impossible à vérifier.\n"
-            "IMPORTANT : Si tu vois ARCHITECT_OUTPUT.md avec un message sur les permissions, ignore-le."
+            "Inspecte le code et rends ton verdict (PASS/FAIL/BLOCKED).\n"
+            "Les résultats d'exécution dans l'historique ont priorité sur l'analyse statique.\n"
+            "BLOCKED uniquement si évaluation structurellement impossible."
         )
         return prompt
 
@@ -537,22 +607,24 @@ class Runner:
 
         EXCLUDED_DIRS = {
             "node_modules", ".git", ".haufcode", "__pycache__",
-            "dist", "build", ".next", "coverage", "logs"
+            "dist", "build", ".next", "coverage", "logs",
         }
         INCLUDED_EXTENSIONS = {
             ".js", ".ts", ".py", ".json", ".yaml", ".yml",
             ".env.example", ".sql", ".sh", ".ejs", ".html",
-            ".css", ".md", ".txt", ".dockerfile", ""
+            ".css", ".md", ".txt", ".dockerfile", "",
         }
-        IGNORED_FILES = {"TODO.md", "ARCHITECTURE.md", "ARCHITECT_OUTPUT.md",
-                         "package-lock.json", "yarn.lock"}
+        IGNORED_FILES = {
+            "TODO.md", "ARCHITECTURE.md", "ARCHITECT_OUTPUT.md",
+            "package-lock.json", "yarn.lock",
+        }
         MAX_TOTAL_CHARS = 60_000
-        MAX_FILE_CHARS  = 10_000
+        MAX_FILE_CHARS = 10_000
 
         proj = Path(self.project_dir)
         slice_text = sl.raw_block or ""
         mentioned = set(_re.findall(
-            r'[\w./\-]+\.(?:js|ts|py|ejs|html|css|json|sql|sh|md)', slice_text
+            r"[\w./\-]+\.(?:js|ts|py|ejs|html|css|json|sql|sh|md)", slice_text
         ))
 
         def _read_entry(filepath: Path):
@@ -573,12 +645,13 @@ class Runner:
         seen: set[str] = set()
         total_chars = 0
 
+        # Passe 1 : fichiers mentionnés dans la slice
         for root, dirs, files in os.walk(proj):
             dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
             for filename in sorted(files):
                 filepath = Path(root) / filename
                 rel, entry = _read_entry(filepath)
-                if not entry or rel in seen:
+                if not entry or not rel or rel in seen:
                     continue
                 if not any(m in rel or rel.endswith(m) for m in mentioned):
                     continue
@@ -587,6 +660,7 @@ class Runner:
                     seen.add(rel)
                     total_chars += len(entry)
 
+        # Passe 2 : reste des fichiers
         for root, dirs, files in os.walk(proj):
             dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
             for filename in sorted(files):
@@ -595,7 +669,7 @@ class Runner:
                     continue
                 filepath = Path(root) / filename
                 rel, entry = _read_entry(filepath)
-                if not entry or rel in seen:
+                if not entry or not rel or rel in seen:
                     continue
                 if total_chars >= MAX_TOTAL_CHARS:
                     collected.append(f"### [Limite atteinte — {total_chars} chars]")
@@ -605,19 +679,23 @@ class Runner:
                     seen.add(rel)
                     total_chars += len(entry)
 
-        if not collected:
-            return "(Aucun fichier source trouvé)"
-        return "\n".join(collected)
+        return "\n".join(collected) if collected else "(Aucun fichier source trouvé)"
 
     def _build_architect_rescue_prompt(self, sl: Slice, notes: str) -> str:
-        return (
+        history_ctx = self._exec_history.to_context() if self._exec_history else ""
+        prompt = (
             f"# Architecte — Prise en charge directe\n\n"
             f"La slice suivante a échoué après {MAX_ITERATIONS} itérations :\n\n"
             f"{sl.raw_block}\n\n"
+        )
+        if history_ctx:
+            prompt += f"{history_ctx}\n\n"
+        prompt += (
             f"## Dernières remarques du Tester\n{notes}\n\n"
-            "Analyse le problème et implémente directement la solution avec WRITE_FILE et RUN. "
+            "Analyse le problème et implémente directement la solution. "
             "N'invente JAMAIS les résultats des commandes — Python les exécute réellement."
         )
+        return prompt
 
     def _build_architect_blocked_prompt(self, sl: Slice, notes: str) -> str:
         return (
@@ -626,8 +704,7 @@ class Runner:
             f"{sl.raw_block}\n\n"
             f"## Motif du blocage\n{notes}\n\n"
             "Résous le blocage : reformule la slice, gère la dépendance, "
-            "ou demande une précision humaine (HUMAN_INPUT_NEEDED: <question>).\n"
-            "Tu peux utiliser WRITE_FILE et RUN pour implémenter directement."
+            "ou demande une précision humaine (HUMAN_INPUT_NEEDED: <question>)."
         )
 
     def _read_file(self, filename: str) -> str:
@@ -636,36 +713,43 @@ class Runner:
             return path.read_text(encoding="utf-8")
         return f"({filename} non disponible)"
 
+    # ── Extraction de verdicts ────────────────────────────────────────────────
+
     @staticmethod
     def _extract_verdict(response: str) -> str:
-        m = re.search(r"VERDICT\s*:\s*(PASS|FAIL|BLOCKED)", response, re.IGNORECASE)
-        return m.group(1).upper() if m else "FAIL"
+        match = re.search(r"VERDICT\s*:\s*(PASS|FAIL|BLOCKED)", response, re.IGNORECASE)
+        return match.group(1).upper() if match else "FAIL"
 
     @staticmethod
     def _extract_tester_notes(response: str) -> str:
-        m = re.search(r"Notes Tester\s*:\s*(.*)", response, re.DOTALL | re.IGNORECASE)
-        if m:
-            return m.group(1).strip()[:500]
+        match = re.search(r"Notes Tester\s*:\s*(.*)", response, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()[:500]
         return ""
 
     @staticmethod
     def _extract_human_question(response: str) -> str:
-        m = re.search(r"HUMAN_INPUT_NEEDED\s*:\s*(.+)", response)
-        return m.group(1).strip() if m else "L'Architecte a besoin de précisions."
+        match = re.search(r"HUMAN_INPUT_NEEDED\s*:\s*(.+)", response)
+        return match.group(1).strip() if match else "L'Architecte a besoin de précisions."
 
 
-# ── exceptions internes ───────────────────────────────────────────────────────
+# ── Exceptions internes ───────────────────────────────────────────────────────
+
 class StopRequested(Exception):
     """Arrêt propre demandé (volontaire)."""
+
 
 class HumanInputNeeded(Exception):
     """L'Architecte attend une réponse humaine — statut WAITING déjà sauvegardé."""
 
+
 class DebugPause(Exception):
     """Pause mode debug après bascule d'agent."""
 
+
 class AutoInterruption(Exception):
     """Interruption automatique (erreur API, quota, etc.)."""
+
 
 class ProjectDone(Exception):
     """Le projet est entièrement terminé."""
