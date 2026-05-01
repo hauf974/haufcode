@@ -167,7 +167,7 @@ def cmd_stop():
     state.stop_requested = True
     state.save()
 
-    print("⏹️  Demande d'arrêt envoyée. L'usine s'arrêtera après la slice en cours.")
+    print("⏹️  Demande d'arrêt envoyée. L'usine s'arrêtera après la tâche en cours.")
     print("   Utilisez 'haufcode status' pour vérifier.")
 
 
@@ -238,11 +238,19 @@ def cmd_status():
     if running and stop_requested:
         status_icon = "🔴 Arrêt demandé (en attente fin de tâche en cours)"
 
+    inactive_label = {
+        "STOPPED": "⭕ Inactive — arrêtée",
+        "WAITING": "⭕ Inactive — en attente",
+        "DONE":    "⭕ Inactive — terminée",
+        "IDLE":    "⭕ Inactive — non démarrée",
+    }
+    usine_label = "🟢 Active" if running else inactive_label.get(state.status, "⭕ Inactive")
+
     print()
     print("─" * 55)
     print("  HaufCode — Statut")
     print("─" * 55)
-    print(f"  Usine   : {'🟢 Active' if running else '⭕ Inactive'}")
+    print(f"  Usine   : {usine_label}")
     print(f"  État    : {status_icon}")
     print(f"  Phase   : {state.phase}")
     print(f"  Sprint  : {state.sprint}")
@@ -274,6 +282,18 @@ def cmd_status():
         mins = summary.get("duree_totale_s", 0) // 60
         print(f"    Durée tot.  : {mins} min")
     print("─" * 55)
+
+    if not running:
+        hints = {
+            "STOPPED": "  💡  Reprenez avec : haufcode resume",
+            "WAITING": "  💡  Répondez via Telegram ou : haufcode resume",
+            "DONE":    "  🏁  Projet terminé. Nouveau projet : haufcode start <PROJET.md>",
+            "IDLE":    "  💡  Démarrez avec : haufcode start <PROJET.md>",
+        }
+        hint = hints.get(state.status)
+        if hint:
+            print(hint)
+
     print()
 
 
