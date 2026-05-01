@@ -146,14 +146,21 @@ class Runner:
             self.state.save()
             return False
 
-        written = write_architect_output(response, self.project_dir)
-        self.log.info(f"📁  Fichiers écrits : {', '.join(written)}")
-
+        # Les fichiers ont été écrits par l'executor pendant _call_agent.
+        # Fallback : tenter write_architect_output pour les modèles qui utilisent
+        # encore l'ancien format markdown.
         from haufcode.planning import has_planning_files as _hpf
+        if not _hpf(self.project_dir):
+            from haufcode.planning import write_architect_output
+            written = write_architect_output(response, self.project_dir)
+            if written:
+                self.log.info(f"📁  Fichiers écrits (format legacy) : {', '.join(written)}")
+
         if not _hpf(self.project_dir):
             self.log.error("❌  Aucun fichier de planification après init Architecte.")
             self.telegram.notify_interruption(
-                "L'Architecte n'a pas pu écrire les fichiers de planification.",
+                "L'Architecte n'a pas écrit les fichiers de planification. "
+                "Relancez avec haufcode resume.",
                 self.state.phase, self.state.sprint, "init-planning",
             )
             self.state.status = "WAITING"

@@ -235,15 +235,36 @@ Voici le cahier des charges du projet :
 
 ---
 
-C'est ta première invocation pour ce projet.
+C'est ta première invocation pour ce projet. Tu dois UNIQUEMENT écrire les fichiers
+de planification. N'écris PAS de code source applicatif à cette étape.
 
 Si des ambiguïtés bloquent la planification :
 HUMAN_INPUT_NEEDED: <question 1> | <question 2>
 
-Sinon, produis :
-a) ARCHITECTURE.md — vision technique complète
-b) PHASE1.md (et les phases suivantes si nécessaire)
-c) TODO.md — liste de toutes les slices
+Sinon, écris ces trois fichiers DANS CET ORDRE EXACT, un par un :
 
+1. D'abord ARCHITECTURE.md :
+WRITE_FILE: ARCHITECTURE.md
+```
+# Architecture
+...(vision technique complète)...
+```
+
+2. Ensuite PHASE1.md (et les autres phases si nécessaire) :
+WRITE_FILE: PHASE1.md
+```
+## Slice S1-1 : ...
+**Statut** : TODO
+...
+```
+
+3. Enfin TODO.md :
+WRITE_FILE: TODO.md
+```
+| Slice | Nom | Statut |
+...
+```
+
+Chaque WRITE_FILE doit contenir le contenu COMPLET du fichier.
 Sois exhaustif. La qualité de cette planification conditionne tout le reste.
 """
