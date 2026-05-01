@@ -211,7 +211,7 @@ class Runner:
 
             sprints = sorted(set(sl.sprint for sl in slices))
             for sprint_num in sprints:
-                if sprint_num < self.state.sprint:
+                if sprint_num < self.state.sprint and phase_num == self.state.phase:
                     continue  # Déjà traité (reprise)
 
                 self.state.sprint = sprint_num

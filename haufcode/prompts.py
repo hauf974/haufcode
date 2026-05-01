@@ -44,6 +44,11 @@ Tu es l'ARCHITECTE. Tes responsabilités :
    **Notes Tester** : (rempli par le Tester en cas de FAIL)
    ```
 
+   Règle obligatoire : chaque phase se termine par une slice
+   "Validation intégration" qui vérifie que l'application démarre
+   sans erreur (node app.js ou docker-compose up) et que les
+   fonctionnalités de la phase s'exécutent correctement ensemble.
+
 3. VÉRIFICATION DE COHÉRENCE (fin de sprint / fin de phase)
    - Relire toutes les slices du sprint/phase.
    - Vérifier l'intégration entre les slices.
