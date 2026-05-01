@@ -2,6 +2,8 @@
 HaufCode — onboarding.py
 Procédure d'onboarding : lien symbolique + configuration Telegram.
 Déclenchée au premier lancement ou via `haufcode init`.
+
+Nécessite les droits root (sudo) pour créer le lien symbolique système.
 """
 import getpass
 import os
@@ -30,9 +32,27 @@ def _ask_yn(prompt: str, default: bool = True) -> bool:
     return ans in ("o", "oui", "y", "yes")
 
 
+# ── vérification root ─────────────────────────────────────────────────────────
+def _check_root():
+    """
+    Refuse l'onboarding si l'utilisateur n'a pas les droits root.
+    Le lien symbolique dans /usr/local/bin/ nécessite root.
+    """
+    if os.geteuid() != 0:
+        print()
+        print("  ❌  HaufCode init requiert les droits root.")
+        print()
+        print("  Relancez avec :")
+        print(f"     sudo {' '.join(sys.argv)}")
+        print()
+        sys.exit(1)
+
+
 # ── onboarding principal ──────────────────────────────────────────────────────
 def run_onboarding():
     """Lance la procédure interactive d'onboarding / mise à jour globale."""
+    _check_root()
+
     cfg = GlobalConfig()
     is_update = cfg.exists()
 
@@ -48,7 +68,7 @@ def run_onboarding():
     # ── 1. Lien symbolique ────────────────────────────────────────────────────
     _setup_symlink(cfg)
 
-    # ── 2. Telegram ───────────────────────────────────────────────────────────
+    # ── 2. Telegram (optionnel) ───────────────────────────────────────────────
     _setup_telegram(cfg)
 
     # ── Sauvegarde ────────────────────────────────────────────────────────────
@@ -58,13 +78,18 @@ def run_onboarding():
     print("  ✅  Configuration globale sauvegardée dans ~/.haufcode/config.json")
     _hr()
 
-    # ── 3. Démarrage du listener Telegram ─────────────────────────────────────
-    _start_telegram_listener(cfg)
+    # ── 3. Démarrage du listener Telegram (si configuré) ─────────────────────
+    if cfg.telegram_token and cfg.telegram_chat_id:
+        _start_telegram_listener(cfg)
+    else:
+        print()
+        print("  ℹ️  Telegram non configuré — notifications désactivées.")
+        print("      Relancez 'sudo haufcode init' pour ajouter Telegram plus tard.")
     print()
 
 
 def _setup_symlink(cfg: GlobalConfig):
-    """Propose la création du lien symbolique /usr/local/bin/haufcode."""
+    """Crée le lien symbolique /usr/local/bin/haufcode."""
     symlink_path = Path("/usr/local/bin/haufcode")
     script_path = Path(sys.argv[0]).resolve()
 
@@ -83,15 +108,11 @@ def _setup_symlink(cfg: GlobalConfig):
             if symlink_path.is_symlink() or symlink_path.exists():
                 symlink_path.unlink()
             symlink_path.symlink_to(script_path)
-            # S'assurer que le script est exécutable
             script_path.chmod(script_path.stat().st_mode | 0o111)
             print(f"  ✅  Lien créé : {symlink_path}")
             cfg.symlink_created = True
-        except PermissionError:
-            print("  ⚠️  Permission refusée. Relancez avec sudo pour créer le lien.")
-            print(f"     Commande : sudo ln -sf {script_path} {symlink_path}")
-        except Exception as e:
-            print(f"  ⚠️  Impossible de créer le lien : {e}")
+        except Exception as exc:
+            print(f"  ⚠️  Impossible de créer le lien : {exc}")
     else:
         print("  ↩️  Lien symbolique ignoré.")
 
@@ -99,33 +120,37 @@ def _setup_symlink(cfg: GlobalConfig):
 
 
 def _setup_telegram(cfg: GlobalConfig):
-    """Configuration interactive du bot Telegram avec test de réception."""
-    print("── Configuration Telegram ───────────────────────────────────")
-    print("  Le bot Telegram permet la surveillance mobile et les notifications.")
-    print("  Créez un bot via @BotFather sur Telegram pour obtenir le token.")
+    """Configuration interactive du bot Telegram (optionnelle)."""
+    print("── Configuration Telegram (optionnelle) ─────────────────────")
+    print("  Le bot Telegram permet les notifications et le contrôle à distance.")
+    print("  Vous pouvez l'ignorer maintenant et l'ajouter plus tard via 'sudo haufcode init'.")
     print()
 
+    has_existing = bool(cfg.telegram_token and cfg.telegram_chat_id)
+    if has_existing:
+        print(f"  Token actuel : {cfg.telegram_token[:10]}…")
+        print(f"  Chat ID actuel : {cfg.telegram_chat_id}")
+        if not _ask_yn("Modifier la configuration Telegram ?", default=False):
+            print()
+            return
+
+    if not has_existing and not _ask_yn("Configurer Telegram maintenant ?", default=False):
+        print("  ↩️  Telegram ignoré. Relancez 'sudo haufcode init' pour l'ajouter.")
+        print()
+        return
+
     # Token
-    current_token = cfg.telegram_token
-    if current_token:
-        print(f"  Token actuel : {current_token[:10]}…")
-        if not _ask_yn("Modifier le token ?", default=False):
-            token = current_token
-        else:
-            token = _ask_telegram_token()
+    if cfg.telegram_token and not _ask_yn("Modifier le token ?", default=False):
+        token = cfg.telegram_token
     else:
+        print("  Créez un bot via @BotFather sur Telegram pour obtenir le token.")
         token = _ask_telegram_token()
 
     cfg.telegram_token = token
 
     # Chat ID
-    current_chat_id = cfg.telegram_chat_id
-    if current_chat_id:
-        print(f"  Chat ID actuel : {current_chat_id}")
-        if not _ask_yn("Modifier le Chat ID ?", default=False):
-            chat_id = current_chat_id
-        else:
-            chat_id = _ask("Chat ID Telegram")
+    if cfg.telegram_chat_id and not _ask_yn("Modifier le Chat ID ?", default=False):
+        chat_id = cfg.telegram_chat_id
     else:
         print("  Envoyez un message à votre bot, puis récupérez votre Chat ID")
         print("  via https://api.telegram.org/bot<TOKEN>/getUpdates")
@@ -144,10 +169,14 @@ def _setup_telegram(cfg: GlobalConfig):
     else:
         print(f"  ❌  Échec de l'envoi : {error}")
         if _ask_yn("Réessayer avec un autre token/Chat ID ?"):
+            cfg.telegram_token = ""
+            cfg.telegram_chat_id = ""
             _setup_telegram(cfg)
             return
         else:
-            print("  ⚠️  Telegram non validé. L'onboarding continue sans garantie de fonctionnement.")
+            print("  ⚠️  Telegram non validé. L'onboarding continue.")
+            cfg.telegram_token = ""
+            cfg.telegram_chat_id = ""
 
     print()
 

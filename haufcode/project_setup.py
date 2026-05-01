@@ -132,12 +132,13 @@ def _ask_yn(prompt: str, default: bool = True) -> bool:
 
 # ── providers ─────────────────────────────────────────────────────────────────
 PROVIDERS = [
-    ("openrouter",      "OpenRouter        (liste auto via API publique)"),
-    ("claude_code_cli", "Claude Code CLI   (abonnement Pro Anthropic, pas de clé API)"),
-    ("anthropic_api",   "Anthropic API     (clé API, facturation à l'usage)"),
-    ("openai",          "OpenAI            (clé API)"),
-    ("ollama",          "Ollama            (modèles locaux)"),
-    ("other",           "Autre             (URL + clé manuelles)"),
+    ("openrouter_tools", "OpenRouter        ✅ function calling only (recommandé Builder/Tester)"),
+    ("openrouter",       "OpenRouter        📋 tous les modèles"),
+    ("claude_code_cli",  "Claude Code CLI   (abonnement Pro Anthropic, pas de clé API)"),
+    ("anthropic_api",    "Anthropic API     (clé API, facturation à l'usage)"),
+    ("openai",           "OpenAI            (clé API)"),
+    ("ollama",           "Ollama            (modèles locaux)"),
+    ("other",            "Autre             (URL + clé manuelles)"),
 ]
 
 ROLE_LABELS = {
@@ -199,9 +200,11 @@ def _configure_agent(cfg: ProjectConfig, role: str):
     provider_idx = _pick("Provider :", [label for _, label in PROVIDERS])
     provider_key, _ = PROVIDERS[provider_idx]
 
-    if provider_key == "openrouter":
-        model, api_key = _setup_openrouter()
-        cfg.set_agent(role, provider_key, model, api_key=api_key)
+    if provider_key in ("openrouter", "openrouter_tools"):
+        tools_only = provider_key == "openrouter_tools"
+        model, api_key = _setup_openrouter(tools_only=tools_only)
+        # On stocke toujours "openrouter" comme provider (openrouter_tools est juste un filtre UI)
+        cfg.set_agent(role, "openrouter", model, api_key=api_key)
 
     elif provider_key == "claude_code_cli":
         _check_claude_code_cli()
@@ -267,26 +270,50 @@ def _get_api_key(provider: str, label: str) -> str:
 
 
 # ── OpenRouter ────────────────────────────────────────────────────────────────
-def _setup_openrouter() -> tuple[str, str]:
+def _setup_openrouter(tools_only: bool = False) -> tuple[str, str]:
+    """
+    Configure un modèle OpenRouter.
+
+    tools_only=True : filtre uniquement les modèles supportant le function calling
+                      (champ supported_parameters contient "tools" dans l'API /models)
+    tools_only=False : liste tous les modèles disponibles
+    """
     api_key = _get_api_key("openrouter", "Clé API OpenRouter")
-    print("  Récupération de la liste des modèles…", end=" ", flush=True)
+    label = "function calling" if tools_only else "tous modèles"
+    print(f"  Récupération de la liste des modèles ({label})…", end=" ", flush=True)
     try:
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/models",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
 
-        models = sorted(
-            [m["id"] for m in data.get("data", [])
-             if any(tag in m.get("id", "").lower()
-                    for tag in ("coder", "instruct", "chat", "qwen", "deepseek",
-                                "mistral", "llama", "gemini", "gpt", "claude",
-                                "command", "phi", "wizard", "yi", "kimi", "nova"))],
-            key=lambda x: x.lower(),
-        )
-        print(f"OK ({len(models)} modèles trouvés)")
+        raw_models = data.get("data", [])
+
+        if tools_only:
+            # Filtrer les modèles dont supported_parameters contient "tools"
+            filtered = [
+                m for m in raw_models
+                if "tools" in m.get("supported_parameters", [])
+            ]
+        else:
+            filtered = [
+                m for m in raw_models
+                if any(tag in m.get("id", "").lower()
+                       for tag in ("coder", "instruct", "chat", "qwen", "deepseek",
+                                   "mistral", "llama", "gemini", "gpt", "claude",
+                                   "command", "phi", "wizard", "yi", "kimi", "nova",
+                                   "devstral", "codestral"))
+            ]
+
+        models = sorted([m["id"] for m in filtered], key=lambda x: x.lower())
+
+        if tools_only:
+            print(f"OK ({len(models)} modèles avec function calling)")
+        else:
+            print(f"OK ({len(models)} modèles trouvés)")
+
         if not models:
             print("  ⚠️  Aucun modèle trouvé, saisie manuelle.")
             return input("  ID du modèle : ").strip(), api_key
@@ -294,10 +321,10 @@ def _setup_openrouter() -> tuple[str, str]:
         idx = _pick("Modèle :", models)
         return models[idx], api_key
 
-    except Exception as e:
-        print(f"Erreur ({e})")
+    except Exception as exc:
+        print(f"Erreur ({exc})")
         print("  ⚠️  Impossible de récupérer la liste. Saisie manuelle.")
-        return _ask("ID du modèle (ex: qwen/qwen-2.5-coder-32b-instruct)"), api_key
+        return _ask("ID du modèle (ex: mistralai/mistral-large-2512)"), api_key
 
 
 # ── Anthropic API / OpenAI ────────────────────────────────────────────────────
@@ -419,38 +446,18 @@ def _check_claude_code_cli():
 
 # ── test de connectivité ──────────────────────────────────────────────────────
 def _test_agent(agent_cfg: dict) -> tuple[bool, str]:
-    """
-    Teste la connectivité et détecte le support du function calling.
-    Met à jour agent_cfg["supports_tool_calls"] en place.
-    """
     from haufcode.agents import AgentClient
-    from haufcode.tool_caller import detect_tool_call_support
     try:
         client = AgentClient(agent_cfg)
         response = client.call("Reply with exactly: OK", max_tokens=10)
         if response is None:
             return False, "Réponse None reçue (modèle inaccessible ou format inattendu)"
         response = str(response).strip()
-        if not ("OK" in response.upper() or len(response) > 0):
-            return False, f"Réponse inattendue : {response[:80]}"
-    except Exception as exc:
-        return False, str(exc)
-
-    # Détecter le support function calling
-    if agent_cfg.get("provider") != "claude_code_cli":
-        print("  🔍  Détection function calling…", end=" ", flush=True)
-        try:
-            supports = detect_tool_call_support(agent_cfg)
-            agent_cfg["supports_tool_calls"] = supports
-            mode = "✅ tool_call natif" if supports else "📝 text_parse (1 action/tour)"
-            print(mode)
-        except Exception as exc:
-            agent_cfg["supports_tool_calls"] = False
-            print(f"erreur ({exc}) — mode text_parse utilisé")
-    else:
-        agent_cfg["supports_tool_calls"] = False
-
-    return True, f"Réponse reçue : {response[:50]}"
+        if "OK" in response.upper() or len(response) > 0:
+            return True, f"Réponse reçue : {response[:50]}"
+        return True, f"Réponse : {response[:80]}"
+    except Exception as e:
+        return False, str(e)
 
 
 # ── configuration GitHub ──────────────────────────────────────────────────────
