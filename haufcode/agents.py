@@ -113,7 +113,8 @@ class AgentClient:
         try:
             choice = result["choices"][0]
             finish_reason = choice.get("finish_reason", "unknown")
-            content = choice["message"]["content"].strip()
+            content = choice["message"].get("content") or ""
+            content = content.strip()
 
             # Logger le finish_reason pour détecter les troncatures
             if finish_reason not in ("stop", "end_turn"):

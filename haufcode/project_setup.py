@@ -423,7 +423,10 @@ def _test_agent(agent_cfg: dict) -> tuple[bool, str]:
     try:
         client = AgentClient(agent_cfg)
         response = client.call("Reply with exactly: OK", max_tokens=10)
-        if response and "OK" in response.upper():
+        if response is None:
+            return False, "Réponse None reçue (modèle inaccessible ou format inattendu)"
+        response = str(response).strip()
+        if "OK" in response.upper() or len(response) > 0:
             return True, f"Réponse reçue : {response[:50]}"
         return True, f"Réponse : {response[:80]}"
     except Exception as e:
