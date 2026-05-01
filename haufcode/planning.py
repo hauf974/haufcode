@@ -71,7 +71,7 @@ class PhaseFile:
         self._slices = []
 
         # Découpe le fichier en blocs par en-tête de slice
-        blocks = re.split(r"(?=^## Slice)", self._content, flags=re.MULTILINE)
+        blocks = re.split(r"(?=^#{2,3}\s+(?:Slice\s+)?S?[\d]+[.-])", self._content, flags=re.MULTILINE)
 
         for block in blocks:
             m = self.SLICE_HEADER.match(block.strip())
