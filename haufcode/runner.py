@@ -88,6 +88,9 @@ class Runner:
             # WAITING déjà sauvegardé dans _debug_pause, on ne touche pas au statut
             self.log.info("🐛  Pause debug. Relancez avec 'haufcode resume [--debug]'.")
 
+        except ProjectDone:
+            self._project_done()
+
         except AutoInterruption as e:
             self.log.error(f"⚠️  Interruption automatique : {e}")
             self.state.status = "WAITING"
