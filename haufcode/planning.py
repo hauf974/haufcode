@@ -158,7 +158,7 @@ class PhaseFile:
                 r"\*\*Notes Tester\*\*\s*:\s*).*?(?=^##|\Z)",
                 re.MULTILINE | re.DOTALL
             )
-            new_notes = f"\g<1>{tester_notes}\n"
+            new_notes = "\\g<1>" + tester_notes + "\n"
             new_content = notes_pattern.sub(new_notes, new_content)
 
         if new_content != content:

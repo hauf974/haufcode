@@ -557,7 +557,7 @@ class Runner:
                     return None, None
                 text = filepath.read_text(encoding="utf-8", errors="replace")
                 if len(text) > MAX_FILE_CHARS:
-                    text = text[:MAX_FILE_CHARS] + f"\n... [tronqué]"
+                    text = text[:MAX_FILE_CHARS] + "\n... [tronqué]"
                 return rel, f"### {rel}\n```\n{text}\n```\n"
             except Exception:
                 return None, None
