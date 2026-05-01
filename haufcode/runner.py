@@ -382,10 +382,38 @@ class Runner:
     def _phase_review(self, phase: int):
         """Demande à l'Architecte de vérifier la cohérence de la phase."""
         self.log.info(f"🔍  Revue Phase {phase}…")
+
+        # Vérifier que TOUTES les slices sont réellement PASS avant la revue
+        phase_file = PhaseFile(phase, self.project_dir)
+        slices = phase_file.get_all_slices()
+        non_pass = [sl for sl in slices if sl.status != "PASS"]
+        if non_pass:
+            names = ", ".join(sl.name for sl in non_pass[:3])
+            self.log.error(
+                f"❌  Revue Phase {phase} avorée : {len(non_pass)} slice(s) non-PASS "
+                f"détectée(s) : {names}. Impossible de déclarer la phase terminée."
+            )
+            raise AutoInterruption(
+                f"Phase {phase} incomplète : {len(non_pass)} slice(s) non-PASS "
+                f"({names}). Vérifiez PHASE{phase}.md."
+            )
+
+        # Vérifier que la phase suivante existe avant de déclarer DONE
+        next_phase_file = PhaseFile(phase + 1, self.project_dir)
+        next_exists = next_phase_file.path.exists()
+
         prompt = PHASE_REVIEW_PROMPT.format(phase=phase)
         response = self._call_agent("ARCHITECT", prompt, ARCHITECT_SYSTEM)
+
+        # Ne déclarer DONE que si l'Architecte dit DONE ET qu'il n'y a pas de phase suivante
         if "NEXT: DONE" in response:
-            raise ProjectDone()
+            if next_exists:
+                self.log.warning(
+                    f"⚠️  L'Architecte dit DONE mais PHASE{phase + 1}.md existe. "
+                    f"On continue vers la phase suivante."
+                )
+            else:
+                raise ProjectDone()
 
     # ── fin de projet ─────────────────────────────────────────────────────────
     def _project_done(self):
