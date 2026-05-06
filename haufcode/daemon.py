@@ -4,6 +4,7 @@ Gestion du démon principal : start, stop, resume, status, logs, changeagents.
 Gestion du PID, du verrou global, et de la reprise sur état sauvegardé.
 """
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -11,10 +12,10 @@ import time
 from pathlib import Path
 
 from haufcode.config import (
+    GLOBAL_CONFIG_DIR,
     GLOBAL_LOCK_FILE,
-    PROJECT_CONFIG_DIR,
+    GLOBAL_PID_FILE,
     PROJECT_PID_FILE,
-    GlobalConfig,
     ProjectConfig,
     ProjectState,
 )
@@ -101,7 +102,6 @@ def _fork_daemon(project_dir: str, projet_md_name: str):
 
     # Rediriger stdin/stdout/stderr vers /dev/null
     import haufcode.logger as hlog
-    from haufcode.config import LOGS_DIR
 
     devnull = open(os.devnull, "r+")
     os.dup2(devnull.fileno(), sys.stdin.fileno())
@@ -425,6 +425,113 @@ def cmd_changeagents():
     cfg.save()
     print("\n✅  Configuration agents mise à jour.")
     print("   Lancez 'haufcode resume' pour reprendre l'usine.\n")
+
+
+# ── remove ───────────────────────────────────────────────────────────────────
+def cmd_remove():
+    """
+    Désinstalle HaufCode du système (sudo requis) :
+      - Arrête le listener Telegram (si actif)
+      - Supprime le lien symbolique /usr/local/bin/haufcode
+      - Supprime la configuration globale ~/.haufcode/
+
+    Ne touche PAS aux répertoires de projet (.haufcode/ locaux,
+    PHASEx.md, code généré, etc.).
+    """
+    if os.geteuid() != 0:
+        print()
+        print("❌  haufcode remove requiert les droits root.")
+        print("   Relancez avec : sudo haufcode remove")
+        print()
+        sys.exit(1)
+
+    print()
+    print("─" * 55)
+    print("  HaufCode — Désinstallation système")
+    print("─" * 55)
+    print()
+    print("  Cette commande supprime :")
+    print("    • Le listener Telegram (processus arrêté)")
+    print("    • Le lien symbolique /usr/local/bin/haufcode")
+    print("    • La configuration globale (~/.haufcode/)")
+    print()
+    print("  ⚠️  Les répertoires de projet ne sont PAS touchés.")
+    print()
+
+    confirm = input("  Confirmer la désinstallation ? [o/N] : ").strip().lower()
+    if confirm not in ("o", "oui", "y", "yes"):
+        print("  Annulé.")
+        return
+
+    print()
+    errors = []
+
+    # 1. Arrêter l'usine si elle tourne
+    if _is_factory_running():
+        print("  ⏹️  Usine en cours — arrêt forcé…")
+        project_dir = _get_active_project_dir()
+        if project_dir:
+            pid_file = Path(project_dir) / PROJECT_PID_FILE
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(1)
+                    print(f"  ✅  Démon principal arrêté (PID {pid})")
+                except Exception as exc:
+                    errors.append(f"Arrêt démon : {exc}")
+
+    # 2. Arrêter le listener Telegram
+    if GLOBAL_PID_FILE.exists():
+        try:
+            pid = int(GLOBAL_PID_FILE.read_text().strip())
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.5)
+                print(f"  ✅  Listener Telegram arrêté (PID {pid})")
+            except ProcessLookupError:
+                print(f"  ℹ️  Listener Telegram déjà arrêté (PID {pid})")
+            except Exception as exc:
+                errors.append(f"Arrêt listener Telegram : {exc}")
+        except (ValueError, OSError) as exc:
+            errors.append(f"Lecture PID Telegram : {exc}")
+        finally:
+            GLOBAL_PID_FILE.unlink(missing_ok=True)
+    else:
+        print("  ℹ️  Pas de listener Telegram actif.")
+
+    # 3. Supprimer le lien symbolique
+    symlink = Path("/usr/local/bin/haufcode")
+    if symlink.is_symlink() or symlink.exists():
+        try:
+            symlink.unlink()
+            print(f"  ✅  Lien symbolique supprimé : {symlink}")
+        except Exception as exc:
+            errors.append(f"Suppression symlink : {exc}")
+    else:
+        print("  ℹ️  Pas de lien symbolique /usr/local/bin/haufcode.")
+
+    # 4. Supprimer la configuration globale ~/.haufcode/
+    if GLOBAL_CONFIG_DIR.exists():
+        try:
+            shutil.rmtree(str(GLOBAL_CONFIG_DIR))
+            print(f"  ✅  Configuration globale supprimée : {GLOBAL_CONFIG_DIR}")
+        except Exception as exc:
+            errors.append(f"Suppression ~/.haufcode : {exc}")
+    else:
+        print("  ℹ️  Pas de configuration globale ~/.haufcode/.")
+
+    # Bilan
+    print()
+    if errors:
+        print("  ⚠️  Désinstallation partielle — erreurs :")
+        for e in errors:
+            print(f"    • {e}")
+    else:
+        print("  ✅  HaufCode désinstallé proprement du système.")
+        print("  💡  Les projets locaux (.haufcode/ dans vos répertoires) sont intacts.")
+        print("  💡  Pour réinstaller : sudo python3 haufcode.py init")
+    print()
 
 
 # ── utilitaires ───────────────────────────────────────────────────────────────

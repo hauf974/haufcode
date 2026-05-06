@@ -44,6 +44,11 @@ COMMANDES
                         Disponible aussi via Telegram : envoyez le message
                         /promptarchitect puis votre texte au bot.
 
+  remove                Désinstalle HaufCode du système (sudo requis) :
+                        arrête le listener Telegram, supprime le lien
+                        symbolique et la configuration globale ~/.haufcode/.
+                        Les répertoires de projet ne sont PAS touchés.
+
   help                  Affiche ce message.
 
 OPTIONS
@@ -63,6 +68,7 @@ EXEMPLES
   haufcode logs
   haufcode stop
   haufcode changeagents
+  sudo haufcode remove
 
 FICHIERS GÉNÉRÉS PAR PROJET
   .haufcode/config.json       Configuration agents + GitHub du projet
@@ -137,9 +143,13 @@ def main():
         from haufcode.daemon import cmd_prompt_architect
         cmd_prompt_architect()
 
+    elif command == "remove":
+        from haufcode.daemon import cmd_remove
+        cmd_remove()
+
     else:
         print(f"❌  Commande inconnue : '{command}'\n")
-        print("Commandes disponibles : init, start, stop, resume, status, logs, changeagents, help")
+        print("Commandes disponibles : init, start, stop, resume, status, logs, changeagents, remove, help")
         print("Tapez 'haufcode help' pour plus de détails.")
         sys.exit(1)
 
