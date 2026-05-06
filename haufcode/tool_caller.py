@@ -1,72 +1,219 @@
 """
-HaufCode — tool_caller.py
+HaufCode — tool_caller.py  (v0.5)
 Abstraction pour l'exécution agentique des modèles IA.
 
 Deux modes selon le support du modèle :
-  - TOOL_CALL  : function calling natif (JSON structuré) — le modèle ne peut pas
-                 halluciner les résultats car Python les injecte après exécution réelle.
-  - TEXT_PARSE : parsing texte strict, UNE action à la fois, avec feedback immédiat.
+  - TOOL_CALL  : function calling natif (JSON structuré).
+  - TEXT_PARSE : parsing texte robuste, MULTI-actions par réponse, avec feedback.
 
-Les deux modes exposent la même interface au Runner via AgentExecutor.run().
+Changements v0.5 par rapport à v0.4 :
+  - Multi-actions par réponse en mode text_parse (queue d'actions)
+  - Parser tolérant aux fences imbriquées (le contenu d'un WRITE_FILE peut être
+    n'importe quel bloc, y compris contenant d'autres ``` à l'intérieur si quotés
+    par des fences plus larges ~~~~)
+  - 4 nouveaux tools : read_file, list_files, delete_file, apply_patch
+  - detect_tool_call_support fiabilisé : test réel avec un tool « write_a_word »
+    + whitelist explicite pour les modèles connus (Mistral, DeepSeek, Qwen...)
+  - ExecutionHistory persistée sur disque (.haufcode/history/<slice_id>.json)
+  - Annotations enrichies : tronque/résumé intelligent
 """
 import json
 import logging
+import os
 import re
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
 
-from haufcode.executor import CommandResult, WriteResult, run_command, write_file
+from haufcode.executor import (
+    CommandResult,
+    WriteResult,
+    ReadResult,
+    ListResult,
+    DeleteResult,
+    PatchResult,
+    apply_patch,
+    delete_file,
+    list_files,
+    read_file_safe,
+    run_command,
+    write_file,
+)
 
 log = logging.getLogger("haufcode")
 
-MAX_TURNS = 10       # Tours max agent ↔ Python par appel
+MAX_TURNS = 12       # Tours max agent ↔ Python par appel (relevé de 10)
 MAX_TOKENS = 4096
 
+# Modèles qui supportent les tools mais que la détection "ping" rate.
+# Ils seront forcés en mode tool_call sans test si la détection échoue.
+TOOL_SUPPORT_WHITELIST_PATTERNS = [
+    r"mistralai/mistral-large",
+    r"mistralai/mistral-medium",
+    r"mistralai/mistral-small",
+    r"mistralai/devstral",
+    r"mistralai/codestral",
+    r"mistralai/ministral",
+    r"deepseek/deepseek-chat",
+    r"deepseek/deepseek-v\d",
+    r"deepseek/deepseek-coder",
+    r"qwen/qwen-2\.5",
+    r"qwen/qwen2\.5",
+    r"qwen/qwen3",
+    r"qwen/qwq",
+    r"openai/gpt-4",
+    r"openai/gpt-5",
+    r"openai/o\d",
+    r"google/gemini",
+    r"anthropic/claude",
+    r"x-ai/grok",
+    r"meta-llama/llama-3\.[123]",
+    r"cohere/command-r",
+]
 
-# ── Historique d'exécution par slice ─────────────────────────────────────────
+
+# ── Historique d'exécution par slice (persistant) ────────────────────────────
+
+@dataclass
+class CommandRecord:
+    cmd: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    annotations: list
+    ok: bool
+
+    @classmethod
+    def from_command_result(cls, r: CommandResult) -> "CommandRecord":
+        return cls(
+            cmd=r.command,
+            exit_code=r.exit_code,
+            stdout=r.stdout[:1500],
+            stderr=r.stderr[:500],
+            annotations=list(r.annotations),
+            ok=r.ok,
+        )
+
 
 @dataclass
 class ExecutionHistory:
     """
-    Historique accumulatif des actions exécutées pour une slice.
-    Transmis entre les itérations Builder→Tester pour éviter de répéter les erreurs.
+    Historique accumulatif des actions d'une slice.
+    Persisté entre itérations ET entre resumes via .haufcode/history/<id>.json
     """
     slice_id: str
-    commands: list[dict] = field(default_factory=list)
-    files_written: list[str] = field(default_factory=list)
+    commands: list = field(default_factory=list)        # list[CommandRecord]
+    files_written: list = field(default_factory=list)   # list[str]
+    files_read: list = field(default_factory=list)      # list[str]
+    files_deleted: list = field(default_factory=list)
+    project_dir: str = "."
 
+    # ── persistence ──
+    @property
+    def _store_path(self) -> Path:
+        safe_id = re.sub(r"[^\w.-]", "_", self.slice_id)
+        return Path(self.project_dir) / ".haufcode" / "history" / f"{safe_id}.json"
+
+    def save(self) -> None:
+        try:
+            p = self._store_path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({
+                "slice_id": self.slice_id,
+                "commands": [asdict(c) if hasattr(c, "__dataclass_fields__") else c
+                             for c in self.commands],
+                "files_written": self.files_written,
+                "files_read": self.files_read,
+                "files_deleted": self.files_deleted,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            log.debug(f"ExecutionHistory.save: {exc}")
+
+    @classmethod
+    def load_or_new(cls, slice_id: str, project_dir: str = ".") -> "ExecutionHistory":
+        h = cls(slice_id=slice_id, project_dir=project_dir)
+        try:
+            if h._store_path.exists():
+                data = json.loads(h._store_path.read_text(encoding="utf-8"))
+                h.files_written = data.get("files_written", [])
+                h.files_read = data.get("files_read", [])
+                h.files_deleted = data.get("files_deleted", [])
+                h.commands = [CommandRecord(**c) if isinstance(c, dict) else c
+                              for c in data.get("commands", [])]
+        except Exception as exc:
+            log.debug(f"ExecutionHistory.load: {exc}")
+        return h
+
+    def reset(self) -> None:
+        """Vide l'historique (au début d'une nouvelle slice)."""
+        self.commands.clear()
+        self.files_written.clear()
+        self.files_read.clear()
+        self.files_deleted.clear()
+        try:
+            if self._store_path.exists():
+                self._store_path.unlink()
+        except Exception:
+            pass
+
+    # ── enregistrement ──
     def add_command(self, result: CommandResult) -> None:
-        self.commands.append({
-            "cmd": result.command,
-            "exit_code": result.exit_code,
-            "stdout": result.stdout[:500],
-            "stderr": result.stderr[:300],
-            "annotations": result.annotations,
-            "ok": result.ok,
-        })
+        self.commands.append(CommandRecord.from_command_result(result))
+        self.save()
 
     def add_file(self, path: str) -> None:
         if path not in self.files_written:
             self.files_written.append(path)
+        self.save()
 
+    def add_read(self, path: str) -> None:
+        if path not in self.files_read:
+            self.files_read.append(path)
+        self.save()
+
+    def add_delete(self, path: str) -> None:
+        self.files_deleted.append(path)
+        if path in self.files_written:
+            self.files_written.remove(path)
+        self.save()
+
+    # ── injection contexte ──
     def to_context(self) -> str:
-        """Résumé injecté en début de prompt pour mémoire de session."""
-        if not self.commands and not self.files_written:
+        if not (self.commands or self.files_written or self.files_read or
+                self.files_deleted):
             return ""
-        lines = ["## Historique des actions de cette slice (itérations précédentes)"]
+        lines = ["## Historique des actions de cette slice"]
         if self.files_written:
-            lines.append(f"Fichiers déjà écrits : {', '.join(self.files_written)}")
+            lines.append(f"📝 Fichiers écrits ({len(self.files_written)}) : "
+                         + ", ".join(self.files_written[:20]))
+        if self.files_read:
+            lines.append(f"👁️  Fichiers lus ({len(self.files_read)}) : "
+                         + ", ".join(self.files_read[:20]))
+        if self.files_deleted:
+            lines.append(f"🗑️  Supprimés : {', '.join(self.files_deleted)}")
         if self.commands:
-            lines.append("Dernières commandes exécutées :")
+            lines.append(f"⚙️  Dernières commandes ({len(self.commands)} au total, "
+                         "6 dernières affichées) :")
             for cmd in self.commands[-6:]:
-                status = "✅" if cmd["ok"] else "❌"
-                lines.append(f"  {status} exit={cmd['exit_code']} — {cmd['cmd']}")
-                if not cmd["ok"] and cmd["stderr"]:
-                    lines.append(f"     stderr: {cmd['stderr'][:200]}")
-                for ann in cmd.get("annotations", []):
+                status = "✅" if cmd.ok else "❌"
+                lines.append(f"  {status} exit={cmd.exit_code}  {cmd.cmd[:140]}")
+                if not cmd.ok and cmd.stderr:
+                    lines.append(f"     stderr: {cmd.stderr[:200]}")
+                for ann in cmd.annotations:
                     lines.append(f"     ⚠️  {ann}")
         return "\n".join(lines)
+
+    # ── détection de boucles (anti-drift) ──
+    def is_repeating_failure(self, n: int = 3) -> bool:
+        """Retourne True si les N dernières commandes ont échoué identiquement."""
+        if len(self.commands) < n:
+            return False
+        recents = self.commands[-n:]
+        if not all(not c.ok for c in recents):
+            return False
+        cmds = {c.cmd.strip() for c in recents}
+        return len(cmds) == 1
 
 
 # ── Définition des tools exposés aux modèles ─────────────────────────────────
@@ -77,20 +224,17 @@ TOOLS = [
         "function": {
             "name": "write_file",
             "description": (
-                "Écrit un fichier dans le projet. Écrase le contenu existant. "
-                "Toujours fournir le contenu COMPLET du fichier."
+                "Écrit (ou ÉCRASE) un fichier dans le projet. Toujours fournir le "
+                "contenu COMPLET. Si tu veux modifier seulement quelques lignes "
+                "d'un fichier existant, préfère apply_patch."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Chemin relatif depuis la racine du projet (ex: routes/auth.js)",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Contenu complet du fichier. Jamais de troncature.",
-                    },
+                    "path": {"type": "string",
+                             "description": "Chemin relatif depuis la racine du projet."},
+                    "content": {"type": "string",
+                                "description": "Contenu complet du fichier."},
                 },
                 "required": ["path", "content"],
             },
@@ -99,20 +243,99 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "run_command",
+            "name": "read_file",
             "description": (
-                "Exécute UNE commande shell dans le répertoire du projet. "
-                "Python exécute réellement et retourne exit_code, stdout, stderr. "
-                "Ne suppose JAMAIS le résultat — attends la réponse de Python. "
-                "Si exit_code != 0 ou si une annotation ⚠️ est présente, c'est un échec."
+                "Lit le contenu d'un fichier du projet. Retourne le contenu texte. "
+                "Indispensable pour vérifier ce qu'un autre agent a écrit ou pour "
+                "consulter ARCHITECTURE.md, package.json, etc."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Commande shell à exécuter (une seule commande).",
-                    },
+                    "path": {"type": "string",
+                             "description": "Chemin relatif du fichier à lire."},
+                    "max_lines": {"type": "integer",
+                                  "description": "Nombre max de lignes à retourner (défaut 500)."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "Liste les fichiers et dossiers du projet (récursif, ignore "
+                "node_modules/.git/.haufcode/dist/build/__pycache__). Permet de "
+                "savoir ce qui existe déjà sans recréer ARCHITECTURE_v2.md, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string",
+                             "description": "Sous-dossier (défaut '.')"},
+                    "pattern": {"type": "string",
+                                "description": "Glob optionnel, ex: '**/*.js'"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": (
+                "Modifie un fichier existant en remplaçant un bloc de texte EXACT "
+                "par un autre. Échoue si old_text n'est pas trouvé ou ambigu (>1 "
+                "occurrences). À privilégier pour les petites modifications."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string",
+                                 "description": "Texte exact à remplacer (doit être unique dans le fichier)."},
+                    "new_text": {"type": "string",
+                                 "description": "Texte de remplacement."},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": (
+                "Supprime un fichier du projet. À utiliser pour nettoyer les "
+                "duplicats (ARCHITECTURE_v2.md, app.js erroné, etc.). "
+                "Refuse les chemins hors projet."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Exécute UNE commande shell (bash) dans le projet. Python exécute "
+                "réellement et retourne exit_code, stdout, stderr. Si exit_code "
+                "!= 0 ou si une annotation ⚠️ apparaît, c'est un échec à corriger. "
+                "IMPORTANT : la commande tourne dans bash (pas dash) — la brace "
+                "expansion `mkdir -p {a,b,c}` fonctionne."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
                 },
                 "required": ["command"],
             },
@@ -123,9 +346,9 @@ TOOLS = [
         "function": {
             "name": "task_complete",
             "description": (
-                "Signale que la tâche est terminée et que tout fonctionne. "
-                "N'appeler QUE si toutes les commandes ont retourné exit_code=0 "
-                "et qu'il n'y a plus d'annotation ⚠️."
+                "Signale que la tâche est terminée. NE PAS appeler tant que des "
+                "commandes échouent ou que des annotations ⚠️ subsistent. Pour le "
+                "Tester : appelle ce tool pour rendre ton verdict (PASS/FAIL/BLOCKED)."
             ),
             "parameters": {
                 "type": "object",
@@ -133,11 +356,12 @@ TOOLS = [
                     "next_role": {
                         "type": "string",
                         "enum": ["BUILDER", "TESTER", "ARCHITECT", "HUMAN", "DONE"],
-                        "description": "Prochain rôle dans le pipeline HaufCode.",
                     },
-                    "summary": {
+                    "summary": {"type": "string"},
+                    "verdict": {
                         "type": "string",
-                        "description": "Résumé de ce qui a été fait et vérifié.",
+                        "enum": ["PASS", "FAIL", "BLOCKED", ""],
+                        "description": "Tester uniquement : PASS/FAIL/BLOCKED. Vide pour Builder/Architect.",
                     },
                 },
                 "required": ["next_role", "summary"],
@@ -146,20 +370,22 @@ TOOLS = [
     },
 ]
 
+# Sous-ensemble pour le Tester (sans write_file / delete_file / apply_patch)
+TESTER_TOOLS = [t for t in TOOLS if t["function"]["name"]
+                in ("read_file", "list_files", "run_command", "task_complete")]
+
 
 # ── AgentExecutor ─────────────────────────────────────────────────────────────
 
 class AgentExecutor:
-    """
-    Exécute la boucle agentique pour un appel modèle.
-    Choisit automatiquement le mode selon supports_tool_calls.
-    """
+    """Exécute la boucle agentique — choisit le mode selon supports_tool_calls."""
 
     def __init__(
         self,
         agent_cfg: dict,
         project_dir: str,
-        history: ExecutionHistory | None = None,
+        history: "ExecutionHistory | None" = None,
+        role: str = "",
     ):
         self.provider = agent_cfg.get("provider", "")
         self.model = agent_cfg.get("model", "")
@@ -167,10 +393,17 @@ class AgentExecutor:
         self.base_url_cfg = agent_cfg.get("base_url", "")
         self.supports_tools = agent_cfg.get("supports_tool_calls", False)
         self.project_dir = project_dir
-        self.history = history or ExecutionHistory(slice_id="")
+        self.role = role.upper()
+        self.history = history or ExecutionHistory(slice_id="adhoc",
+                                                    project_dir=project_dir)
+
+    def _tools_for_role(self) -> list:
+        """Retourne le sous-ensemble de tools autorisé pour ce rôle."""
+        if self.role == "TESTER":
+            return TESTER_TOOLS
+        return TOOLS
 
     def run(self, prompt: str, system: str, max_tokens: int = MAX_TOKENS) -> str:
-        """Lance la boucle agentique et retourne la réponse textuelle finale."""
         if self.supports_tools:
             return self._run_tool_call_mode(prompt, system, max_tokens)
         return self._run_text_parse_mode(prompt, system, max_tokens)
@@ -178,39 +411,32 @@ class AgentExecutor:
     # ── Mode function calling natif ───────────────────────────────────────────
 
     def _run_tool_call_mode(self, prompt: str, system: str, max_tokens: int) -> str:
-        """
-        Boucle agentique avec function calling natif.
-        Le modèle produit des tool_calls JSON structurés — impossible d'halluciner.
-        """
         messages = _build_messages(prompt, system)
         last_text = ""
+        tools_for_role = self._tools_for_role()
 
         for turn in range(MAX_TURNS):
-            raw = self._api_call(messages, max_tokens, tools=TOOLS)
-
-            # Parser la réponse selon le format (Anthropic ou OpenAI)
+            raw = self._api_call(messages, max_tokens, tools=tools_for_role)
             text_content, tool_calls = _parse_response(raw)
             if text_content:
                 last_text = text_content
 
             if not tool_calls:
-                # Pas de tool calls → réponse finale
                 return text_content or last_text or "(réponse vide)"
 
-            # Construire le message assistant avec tool calls
             assistant_msg = _build_assistant_message(text_content, tool_calls, raw)
             messages.append(assistant_msg)
 
-            # Exécuter chaque tool call et collecter les résultats
             done = False
             tool_results = []
             for tc in tool_calls:
                 tool_name = tc.get("name", "")
-                tool_input = tc.get("input", {})
+                tool_input = tc.get("input", {}) or {}
                 tool_id = tc.get("id", f"call_{turn}")
 
                 result_str = self._execute_tool(tool_name, tool_input)
-                log.info(f"  🔧 [{tool_name}] → {result_str[:120]}")
+                preview = result_str[:160].replace("\n", " ")
+                log.info(f"  🔧 [{tool_name}] {preview}")
 
                 tool_results.append({
                     "role": "tool",
@@ -222,116 +448,174 @@ class AgentExecutor:
                     done = True
 
             messages.extend(tool_results)
-
             if done:
                 return last_text or text_content or "(tâche terminée)"
 
         return last_text or "(MAX_TURNS atteint)"
 
-    # ── Mode text parse strict ────────────────────────────────────────────────
+    # ── Mode text parse (multi-actions) ───────────────────────────────────────
 
     def _run_text_parse_mode(self, prompt: str, system: str, max_tokens: int) -> str:
-        """
-        Boucle agentique pour les modèles sans function calling.
-        Demande UNE action à la fois, exécute, retourne le résultat réel.
-        """
-        # Injecter l'historique dans le prompt
         history_ctx = self.history.to_context()
         full_prompt = f"{history_ctx}\n\n{prompt}" if history_ctx else prompt
-
         messages = _build_messages(full_prompt, system)
         last_text = ""
 
         for turn in range(MAX_TURNS):
             raw = self._api_call(messages, max_tokens, tools=None)
-            _, _ = _parse_response(raw)  # ignore tool_calls (pas supporté)
-
-            # Récupérer le texte brut
             response = _extract_text(raw)
             last_text = response
 
-            # Chercher UNE action dans la réponse
-            action = _parse_one_action(response)
+            actions = _parse_all_actions(response)
 
-            if action is None:
-                # Pas d'action → réponse finale
+            if not actions:
+                # Pas d'action → réponse finale (rapport/verdict/etc.)
                 return response
-
-            if action["type"] == "done":
-                return response
-
-            # Exécuter l'action
-            if action["type"] == "write_file":
-                wr: WriteResult = write_file(
-                    action["path"], action["content"], self.project_dir
-                )
-                self.history.add_file(action["path"])
-                feedback = wr.to_report()
-                log.info(f"  📝 {feedback}")
-                has_error = not wr.ok
-
-            elif action["type"] == "run_command":
-                cr: CommandResult = run_command(action["command"], self.project_dir)
-                self.history.add_command(cr)
-                feedback = cr.to_report()
-                log.info(f"  🔧 {feedback[:120]}")
-                has_error = not cr.ok
-
-            else:
-                feedback = f"Action non reconnue : {action}"
-                has_error = True
-
-            # Construire le feedback pour le tour suivant
-            next_instruction = (
-                "⚠️ ERREUR DÉTECTÉE. Tu DOIS corriger cette erreur avant de continuer. "
-                "Analyse le message d'erreur et produis la correction (UNE action à la fois)."
-                if has_error
-                else "Action suivante (UNE SEULE), ou TASK_COMPLETE si tout est terminé et vérifié :"
-            )
 
             messages.append({"role": "assistant", "content": response})
+
+            feedbacks = []
+            done = False
+            any_error = False
+
+            for act in actions:
+                feedback, ok, terminal = self._exec_action_text_mode(act)
+                feedbacks.append(feedback)
+                if not ok:
+                    any_error = True
+                if terminal:
+                    done = True
+                    break
+
+            joined = "\n\n".join(feedbacks)
+            if done:
+                # On laisse le modèle conclure (rendre verdict / résumé final)
+                return f"{response}\n\n{joined}"
+
+            next_instruction = (
+                "⚠️ ERREUR(S) DÉTECTÉE(S) ci-dessus. Lis attentivement les messages "
+                "(stderr, annotations ⚠️) et corrige avant de continuer."
+                if any_error else
+                "Continue : tu peux enchaîner plusieurs actions dans la même réponse "
+                "(WRITE_FILE/RUN/READ_FILE/...). Termine par TASK_COMPLETE quand tout "
+                "est vérifié et fonctionnel."
+            )
             messages.append({
                 "role": "user",
-                "content": f"Résultat :\n{feedback}\n\n{next_instruction}",
+                "content": f"Résultats :\n{joined}\n\n{next_instruction}",
             })
 
         return last_text
 
-    # ── Exécution des tools (mode tool_call) ──────────────────────────────────
+    # ── Exécution d'une action (text mode) ────────────────────────────────────
+
+    def _exec_action_text_mode(self, action: dict):
+        kind = action.get("type")
+        if kind == "done":
+            return ("→ TASK_COMPLETE", True, True)
+
+        if kind == "write_file":
+            wr = write_file(action["path"], action["content"], self.project_dir)
+            if wr.ok:
+                self.history.add_file(action["path"])
+            log.info(f"  📝 {wr.to_report()}")
+            return (wr.to_report(), wr.ok, False)
+
+        if kind == "read_file":
+            rd = read_file_safe(action["path"], self.project_dir,
+                                max_lines=action.get("max_lines", 500))
+            if rd.ok:
+                self.history.add_read(action["path"])
+            log.info(f"  👁️  {rd.to_report()[:120]}")
+            return (rd.to_report(), rd.ok, False)
+
+        if kind == "list_files":
+            ls = list_files(self.project_dir, subpath=action.get("path", "."),
+                            pattern=action.get("pattern"))
+            log.info(f"  📂 list_files: {len(ls.entries)} entrées")
+            return (ls.to_report(), True, False)
+
+        if kind == "apply_patch":
+            pr = apply_patch(action["path"], action["old_text"],
+                             action["new_text"], self.project_dir)
+            if pr.ok:
+                self.history.add_file(action["path"])
+            log.info(f"  ✏️  {pr.to_report()}")
+            return (pr.to_report(), pr.ok, False)
+
+        if kind == "delete_file":
+            dr = delete_file(action["path"], self.project_dir)
+            if dr.ok:
+                self.history.add_delete(action["path"])
+            log.info(f"  🗑️  {dr.to_report()}")
+            return (dr.to_report(), dr.ok, False)
+
+        if kind == "run_command":
+            cr = run_command(action["command"], self.project_dir)
+            self.history.add_command(cr)
+            log.info(f"  🔧 exit={cr.exit_code}  {action['command'][:120]}")
+            return (cr.to_report(), cr.ok, False)
+
+        return (f"Action non reconnue : {action}", False, False)
+
+    # ── Exécution d'un tool (mode tool_call) ──────────────────────────────────
 
     def _execute_tool(self, name: str, args: dict) -> str:
-        """Exécute un tool call et retourne le résultat sérialisé pour le modèle."""
         if name == "write_file":
-            path = args.get("path", "")
-            content = args.get("content", "")
-            result = write_file(path, content, self.project_dir)
-            if result.ok:
-                self.history.add_file(path)
-            return result.to_report()
+            res = write_file(args.get("path", ""), args.get("content", ""),
+                             self.project_dir)
+            if res.ok:
+                self.history.add_file(args.get("path", ""))
+            return res.to_report()
+
+        if name == "read_file":
+            res = read_file_safe(args.get("path", ""), self.project_dir,
+                                 max_lines=int(args.get("max_lines") or 500))
+            if res.ok:
+                self.history.add_read(args.get("path", ""))
+            return res.to_report()
+
+        if name == "list_files":
+            res = list_files(self.project_dir,
+                             subpath=args.get("path", "."),
+                             pattern=args.get("pattern"))
+            return res.to_report()
+
+        if name == "apply_patch":
+            res = apply_patch(args.get("path", ""),
+                              args.get("old_text", ""),
+                              args.get("new_text", ""),
+                              self.project_dir)
+            if res.ok:
+                self.history.add_file(args.get("path", ""))
+            return res.to_report()
+
+        if name == "delete_file":
+            res = delete_file(args.get("path", ""), self.project_dir)
+            if res.ok:
+                self.history.add_delete(args.get("path", ""))
+            return res.to_report()
 
         if name == "run_command":
-            command = args.get("command", "")
-            result = run_command(command, self.project_dir)
-            self.history.add_command(result)
-            # Retourner JSON structuré + rapport lisible
-            report = result.to_report()
-            data = result.to_dict()
-            data["report"] = report
+            cmd = args.get("command", "")
+            res = run_command(cmd, self.project_dir)
+            self.history.add_command(res)
+            data = res.to_dict()
+            data["report"] = res.to_report()
             return json.dumps(data, ensure_ascii=False)
 
         if name == "task_complete":
             next_role = args.get("next_role", "TESTER")
             summary = args.get("summary", "Tâche terminée.")
-            return f"TASK_COMPLETE — NEXT: {next_role}\n{summary}"
+            verdict = args.get("verdict", "")
+            v = f" [VERDICT: {verdict}]" if verdict else ""
+            return f"TASK_COMPLETE — NEXT: {next_role}{v}\n{summary}"
 
         return f"Tool inconnu : {name}"
 
     # ── Appel API ─────────────────────────────────────────────────────────────
 
-    def _api_call(
-        self, messages: list, max_tokens: int, tools: list | None
-    ) -> dict:
-        """Appelle l'API avec ou sans tools."""
+    def _api_call(self, messages: list, max_tokens: int, tools: "list | None") -> dict:
         base_url = self._resolve_base_url()
         url = f"{base_url}/chat/completions"
 
@@ -359,9 +643,10 @@ class AgentExecutor:
                 result = json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             body = exc.read().decode(errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} depuis {self.provider} : {body}") from exc
+            raise RuntimeError(
+                f"HTTP {exc.code} depuis {self.provider} : {body[:500]}"
+            ) from exc
 
-        # Logguer finish_reason si anormal
         try:
             choice = result.get("choices", [{}])[0]
             finish_reason = choice.get("finish_reason", "unknown")
@@ -390,17 +675,31 @@ class AgentExecutor:
         return url.rstrip("/")
 
 
-# ── Détection du support function calling ────────────────────────────────────
+# ── Détection du support function calling (fiabilisée) ──────────────────────
 
 def detect_tool_call_support(agent_cfg: dict) -> bool:
     """
-    Teste si un modèle supporte le function calling en envoyant un appel minimal.
-    Retourne True si la réponse contient des tool_calls.
-    Stocke le résultat dans agent_cfg["supports_tool_calls"].
+    Stratégie en 3 étapes :
+      1. Whitelist : si le modèle correspond à un pattern connu → True.
+      2. Test réel : demande au modèle d'écrire un mot via un tool dédié.
+      3. Échec → False.
     """
     if agent_cfg.get("provider") == "claude_code_cli":
         return False
 
+    model = agent_cfg.get("model", "").lower()
+
+    # 1. Whitelist
+    for pattern in TOOL_SUPPORT_WHITELIST_PATTERNS:
+        if re.search(pattern, model):
+            log.info(f"  detect_tool_calls({model}): True (whitelist)")
+            return True
+
+    # 2. Test réel
+    return _api_test_tool_call(agent_cfg)
+
+
+def _api_test_tool_call(agent_cfg: dict) -> bool:
     provider = agent_cfg.get("provider", "")
     model = agent_cfg.get("model", "")
     api_key = agent_cfg.get("api_key", "")
@@ -420,16 +719,26 @@ def detect_tool_call_support(agent_cfg: dict) -> bool:
     test_tools = [{
         "type": "function",
         "function": {
-            "name": "ping",
-            "description": "Test de support function calling.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "name": "echo_word",
+            "description": "Echoes a single word back. Call this with the word 'pong'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "word": {"type": "string"},
+                },
+                "required": ["word"],
+            },
         },
     }]
 
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 20,
+        "messages": [
+            {"role": "system", "content":
+             "You must use the echo_word tool. Do not respond in plain text."},
+            {"role": "user", "content": "Call echo_word with the word 'pong'."},
+        ],
+        "max_tokens": 60,
         "tools": test_tools,
         "tool_choice": "auto",
     }
@@ -445,17 +754,15 @@ def detect_tool_call_support(agent_cfg: dict) -> bool:
         req = urllib.request.Request(
             f"{base}/chat/completions", data=data, headers=headers, method="POST"
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             result = json.loads(resp.read())
-
         choice = result.get("choices", [{}])[0]
         msg = choice.get("message", {})
         has_tc = bool(msg.get("tool_calls"))
-        log.info(f"  detect_tool_calls({model}): {has_tc}")
+        log.info(f"  detect_tool_calls({model}): {has_tc} (test API)")
         return has_tc
-
     except Exception as exc:
-        log.debug(f"detect_tool_call_support({model}): {exc}")
+        log.debug(f"detect_tool_call_support({model}) erreur : {exc}")
         return False
 
 
@@ -470,7 +777,6 @@ def _build_messages(prompt: str, system: str) -> list:
 
 
 def _extract_text(raw: dict) -> str:
-    """Extrait le texte brut d'une réponse API."""
     try:
         choice = raw.get("choices", [{}])[0]
         content = choice.get("message", {}).get("content") or ""
@@ -479,33 +785,34 @@ def _extract_text(raw: dict) -> str:
         return ""
 
 
-def _parse_response(raw: dict) -> tuple[str, list]:
-    """
-    Parse une réponse API et retourne (text_content, tool_calls).
-    Compatible OpenAI et Anthropic.
-    """
+def _parse_response(raw: dict):
+    """Parse une réponse API → (text_content, tool_calls)."""
     text_parts = []
     tool_calls = []
 
-    # Format OpenAI / OpenRouter
     choices = raw.get("choices", [])
     if choices:
         choice = choices[0]
         msg = choice.get("message", {})
         if msg.get("content"):
             text_parts.append(str(msg["content"]))
-        for tc in msg.get("tool_calls", []):
+        for tc in msg.get("tool_calls", []) or []:
             try:
+                args = tc["function"].get("arguments", "{}")
+                if isinstance(args, str):
+                    parsed = json.loads(args)
+                else:
+                    parsed = args
                 tool_calls.append({
                     "id": tc.get("id", ""),
                     "name": tc["function"]["name"],
-                    "input": json.loads(tc["function"].get("arguments", "{}")),
+                    "input": parsed,
                 })
-            except (KeyError, json.JSONDecodeError):
-                pass
+            except (KeyError, json.JSONDecodeError) as exc:
+                log.debug(f"tool_call parse error: {exc}")
 
     # Format Anthropic natif
-    for block in raw.get("content", []):
+    for block in raw.get("content", []) or []:
         if block.get("type") == "text":
             text_parts.append(block.get("text", ""))
         elif block.get("type") == "tool_use":
@@ -519,13 +826,9 @@ def _parse_response(raw: dict) -> tuple[str, list]:
 
 
 def _build_assistant_message(text: str, tool_calls: list, raw: dict) -> dict:
-    """Construit le message assistant pour la prochaine itération."""
-    # Format OpenAI
     if raw.get("choices"):
         msg = raw["choices"][0].get("message", {})
         return {"role": "assistant", **{k: v for k, v in msg.items() if k != "role"}}
-
-    # Format Anthropic — reconstruire
     content_blocks = []
     if text:
         content_blocks.append({"type": "text", "text": text})
@@ -539,61 +842,214 @@ def _build_assistant_message(text: str, tool_calls: list, raw: dict) -> dict:
     return {"role": "assistant", "content": content_blocks}
 
 
-# ── Parser pour le mode text_parse ───────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Parser texte robuste pour le mode text_parse (v0.5)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Stratégie : on parse la réponse complète et on extrait TOUTES les actions,
+# dans l'ordre. Trois formats supportés simultanément :
+#
+#   A. Format "fence-direct" (le plus courant) :
+#        WRITE_FILE: chemin
+#        ```[lang]
+#        contenu
+#        ```
+#
+#   B. Format "wrapped" (Mistral, devstral) :
+#        ```bash
+#        WRITE_FILE: chemin
+#        ```
+#        ```[lang]
+#        contenu
+#        ```
+#
+#   C. Format ligne (RUN, TASK_COMPLETE, NEXT:) :
+#        RUN: <commande>
+#        READ_FILE: chemin
+#        LIST_FILES [path]
+#        DELETE_FILE: chemin
+#        APPLY_PATCH: chemin
+#        ```old
+#        ancien texte
+#        ```
+#        ```new
+#        nouveau texte
+#        ```
+#        TASK_COMPLETE
+#        NEXT: TESTER|BUILDER|...
+#
+# Le parser scanne séquentiellement la réponse et extrait des "actions" dans
+# l'ordre. Les actions sont retournées sous forme de liste de dicts.
 
-_WRITE_FILE_RE = re.compile(
-    r"WRITE_FILE:\s*(\S+)\s*\n```[^\n]*\n(.*?)```", re.DOTALL
-)
-_WRITE_FILE_ALT_RE = re.compile(
-    r"WRITE_FILE:\s*\n\s*[Pp]ath:\s*(\S+)\s*\n\s*[Cc]ontent:\s*\|?\s*\n"
-    r"(.*?)(?=\n\s*WRITE_FILE:|\nRUN:|\nTASK_COMPLETE:|\nNEXT:|\Z)",
-    re.DOTALL,
-)
-_RUN_RE = re.compile(r"^RUN:\s*(.+)$", re.MULTILINE)
-_BASH_RE = re.compile(r"```(?:bash|sh)\s*\n(.*?)```", re.DOTALL)
-_DONE_RE = re.compile(
-    r"TASK_COMPLETE|NEXT:\s*(TESTER|ARCHITECT|BUILDER|HUMAN|DONE)", re.IGNORECASE
+# Regex utilitaires (expression atomique d'un fence)
+_FENCE_OPEN = r"```[^\n]*\n"
+_FENCE_CLOSE = r"\n?```"
+
+
+def _find_fence_after(text: str, pos: int):
+    """Trouve le prochain fence ``` ouvrant après pos, retourne (start, content_start, content_end, end) ou None."""
+    m = re.search(_FENCE_OPEN, text[pos:])
+    if not m:
+        return None
+    open_start = pos + m.start()
+    content_start = pos + m.end()
+    # chercher la fermeture
+    rest = text[content_start:]
+    m_close = re.search(r"\n?```", rest)
+    if not m_close:
+        return None
+    content_end = content_start + m_close.start()
+    end = content_start + m_close.end()
+    return (open_start, content_start, content_end, end)
+
+
+# Préfixes d'action ligne-orientées
+ACTION_LINE_RE = re.compile(
+    r"^(?P<kind>WRITE_FILE|READ_FILE|RUN|LIST_FILES|DELETE_FILE|APPLY_PATCH|TASK_COMPLETE|NEXT)"
+    r"\s*[:\s]\s*(?P<arg>.*?)$",
+    re.MULTILINE | re.IGNORECASE,
 )
 
 
-def _parse_one_action(response: str) -> dict | None:
+def _strip_action_keywords_from_fence(content: str) -> str:
+    """Si le fence commence par 'WRITE_FILE: xxx\\n' (cas Mistral wrapped),
+    retire cette ligne pour récupérer le vrai contenu après."""
+    lines = content.splitlines()
+    if lines and re.match(r"^(WRITE_FILE|RUN|TASK_COMPLETE|READ_FILE|"
+                          r"LIST_FILES|DELETE_FILE|APPLY_PATCH|NEXT)\s*[:\s]",
+                          lines[0], re.IGNORECASE):
+        return "\n".join(lines[1:])
+    return content
+
+
+def _parse_all_actions(response: str) -> list:
     """
-    Extrait LA PREMIÈRE action trouvée dans la réponse texte.
-    Retourne None si la réponse ne contient aucune action (→ réponse finale).
+    Extrait TOUTES les actions dans l'ordre. Tolérant aux variantes de format.
+    Retourne une liste d'action-dicts.
     """
-    # WRITE_FILE format standard
-    match = _WRITE_FILE_RE.search(response)
-    if match:
-        return {"type": "write_file", "path": match.group(1).strip(),
-                "content": match.group(2)}
+    actions = []
+    text = response
 
-    # WRITE_FILE format alternatif (Mistral)
-    match = _WRITE_FILE_ALT_RE.search(response)
-    if match:
-        raw = match.group(2)
-        lines = raw.splitlines()
-        indent = min(
-            (len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0
-        )
-        content = "\n".join(
-            ln[indent:] if len(ln) >= indent else ln for ln in lines
-        ).strip()
-        return {"type": "write_file", "path": match.group(1).strip(), "content": content}
+    line_matches = list(ACTION_LINE_RE.finditer(text))
+    consumed_until = 0
 
-    # RUN: en début de ligne
-    match = _RUN_RE.search(response)
-    if match:
-        return {"type": "run_command", "command": match.group(1).strip()}
+    def _is_inside_fence(pos: int) -> bool:
+        """True si pos est à l'intérieur d'un fence ``` ouvert (compte les fences avant)."""
+        before = text[:pos]
+        # Compte les triples-backticks. Pair = à l'extérieur, impair = dedans.
+        n = len(re.findall(r"```", before))
+        return (n % 2) == 1
 
-    # Commandes dans blocs ```bash — première ligne non-commentaire
-    for bash_m in _BASH_RE.finditer(response):
-        for line in bash_m.group(1).splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and not line.startswith("EOF"):
-                return {"type": "run_command", "command": line}
+    for lm in line_matches:
+        if lm.start() < consumed_until:
+            continue
 
-    # TASK_COMPLETE ou NEXT:
-    if _DONE_RE.search(response):
-        return {"type": "done"}
+        kind = lm.group("kind").upper()
+        arg = lm.group("arg").strip().strip(":").strip()
 
-    return None
+        # Si l'action ligne est elle-même DANS un fence ouvert (cas Mistral wrapped),
+        # c'est OK : elle marque le début d'une action wrapped, et le fence qui suit
+        # immédiatement est le fence de FERMETURE du wrapper, pas le contenu.
+        wrapped = _is_inside_fence(lm.start())
+
+        if kind in ("WRITE_FILE", "APPLY_PATCH"):
+            if not arg:
+                continue
+            end_of_line = lm.end()
+
+            if wrapped:
+                # On est à l'intérieur d'un fence wrapper. Le prochain ``` est sa
+                # fermeture — on le saute pour atteindre le vrai fence de contenu.
+                m_close = re.search(r"```\s*\n?", text[end_of_line:])
+                if m_close:
+                    end_of_line += m_close.end()
+
+            if kind == "APPLY_PATCH":
+                f1 = _find_fence_after(text, end_of_line)
+                if not f1:
+                    continue
+                old_text = _strip_action_keywords_from_fence(
+                    text[f1[1]:f1[2]]).rstrip("\n")
+                f2 = _find_fence_after(text, f1[3])
+                if not f2:
+                    continue
+                new_text = _strip_action_keywords_from_fence(
+                    text[f2[1]:f2[2]]).rstrip("\n")
+                actions.append({
+                    "type": "apply_patch",
+                    "path": arg,
+                    "old_text": old_text,
+                    "new_text": new_text,
+                })
+                consumed_until = f2[3]
+            else:
+                f = _find_fence_after(text, end_of_line)
+                if not f:
+                    continue
+                content = text[f[1]:f[2]]
+                content = _strip_action_keywords_from_fence(content).rstrip("\n")
+                actions.append({
+                    "type": "write_file",
+                    "path": arg,
+                    "content": content,
+                })
+                consumed_until = f[3]
+
+        elif kind == "READ_FILE":
+            if wrapped:
+                continue  # mention dans une doc, on ignore
+            if not arg:
+                continue
+            actions.append({"type": "read_file", "path": arg})
+            consumed_until = lm.end()
+
+        elif kind == "DELETE_FILE":
+            if wrapped:
+                continue
+            if not arg:
+                continue
+            actions.append({"type": "delete_file", "path": arg})
+            consumed_until = lm.end()
+
+        elif kind == "LIST_FILES":
+            if wrapped:
+                continue
+            sub = arg if arg else "."
+            actions.append({"type": "list_files", "path": sub})
+            consumed_until = lm.end()
+
+        elif kind == "RUN":
+            if wrapped:
+                # Cas Mistral : "```bash\nRUN: cmd\n```" — on accepte mais on saute le fence fermant
+                end_of_line = lm.end()
+                m_close = re.search(r"```\s*\n?", text[end_of_line:])
+                if m_close:
+                    consumed_until = end_of_line + m_close.end()
+                else:
+                    consumed_until = lm.end()
+            else:
+                consumed_until = lm.end()
+            if not arg:
+                continue
+            actions.append({"type": "run_command", "command": arg})
+
+        elif kind == "TASK_COMPLETE":
+            actions.append({"type": "done"})
+            consumed_until = lm.end()
+            break
+
+        elif kind == "NEXT":
+            actions.append({"type": "done"})
+            consumed_until = lm.end()
+            break
+
+    if not actions:
+        bash_block = re.search(r"```(?:bash|sh)\s*\n(.*?)```", response, re.DOTALL)
+        if bash_block:
+            for line in bash_block.group(1).splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith("//"):
+                    actions.append({"type": "run_command", "command": line})
+                    break
+
+    return actions

@@ -1,7 +1,15 @@
 """
-HaufCode — runner.py
+HaufCode — runner.py  (v0.5)
 Boucle principale de l'usine : Architecte → Builder → Tester.
-Gère les verdicts PASS / FAIL / BLOCKED, les itérations, les revues de sprint/phase.
+
+Changements v0.5 :
+  - ExecutionHistory persistée (load_or_new) → resume sans perte d'historique
+  - RescueCounter persistant → cap à MAX_RESCUES_BEFORE_HUMAN puis escalade
+  - Détection rubber-stamp via anti_drift (Tester PASS sans command exécutée
+    après plusieurs itérations → on retraite en FAIL)
+  - ProjectIndex au lieu de _collect_project_files (dump 60K → tree compact +
+    fichiers pertinents seulement)
+  - Extraction verdict robuste (gère "**VERDICT**: ...", "Verdict révisé: ...")
 """
 import re
 import time
@@ -12,7 +20,7 @@ from haufcode import logger as hlog
 from haufcode.agents import AgentClient, get_agent
 from haufcode.config import GlobalConfig, ProjectConfig, ProjectState
 from haufcode.metrics import record as record_metric
-from haufcode.planning import PhaseFile, Slice, write_architect_output
+from haufcode.planning import PhaseFile, Slice
 from haufcode.prompts import (
     ARCHITECT_INIT_PROMPT,
     PHASE_REVIEW_PROMPT,
@@ -21,6 +29,14 @@ from haufcode.prompts import (
 )
 from haufcode.telegram_client import TelegramClient
 from haufcode.tool_caller import ExecutionHistory
+from haufcode.project_index import ProjectIndex
+from haufcode.anti_drift import (
+    RescueCounter,
+    extract_verdict as _ad_extract_verdict,
+    is_rubber_stamp,
+    should_escalate_human,
+    MAX_RESCUES_BEFORE_HUMAN,
+)
 
 MAX_ITERATIONS = 5  # Itérations Builder→Tester avant escalade à l'Architecte
 
@@ -44,8 +60,12 @@ class Runner:
         self._agents: dict[str, AgentClient] = {}
         gcfg = GlobalConfig()
         self.telegram = TelegramClient(gcfg.telegram_token, gcfg.telegram_chat_id)
-        # Historique d'exécution courant (réinitialisé à chaque slice)
+        # Historique d'exécution courant — chargé/sauvegardé par slice
         self._exec_history: ExecutionHistory | None = None
+        # Compteur de rescues pour la slice courante
+        self._rescue_counter = RescueCounter.load(project_dir)
+        # Index du projet (mise à jour incrémentale)
+        self._index = ProjectIndex.load_or_scan(project_dir)
 
     # ── Accès aux agents ──────────────────────────────────────────────────────
 
@@ -73,7 +93,6 @@ class Runner:
         self.log.info("🏭  HaufCode démarré.")
 
         try:
-            # Message utilisateur en attente pour l'Architecte ?
             self._inject_architect_prompt_if_pending()
 
             if self.state.current_role == "ARCHITECT" and self.state.slice_index == 0:
@@ -133,8 +152,12 @@ class Runner:
         projet_content = projet_md.read_text(encoding="utf-8")
         prompt = ARCHITECT_INIT_PROMPT.format(projet_md_content=projet_content)
 
+        # Historique éphémère pour la phase d'init (pas de slice_id stable)
+        init_history = ExecutionHistory(slice_id="init-planning",
+                                        project_dir=self.project_dir)
+
         t0 = time.time()
-        response = self._call_agent("ARCHITECT", prompt)
+        response = self._call_agent("ARCHITECT", prompt, history=init_history)
         duration = time.time() - t0
 
         if "HUMAN_INPUT_NEEDED:" in response:
@@ -146,9 +169,6 @@ class Runner:
             self.state.save()
             return False
 
-        # Les fichiers ont été écrits par l'executor pendant _call_agent.
-        # Fallback : tenter write_architect_output pour les modèles qui utilisent
-        # encore l'ancien format markdown.
         from haufcode.planning import has_planning_files as _hpf
         if not _hpf(self.project_dir):
             from haufcode.planning import write_architect_output
@@ -172,12 +192,13 @@ class Runner:
             role="ARCHITECT", agent_name=self._agent_name("ARCHITECT"),
             slice_name="init-planning", duration_s=duration, statut="PASS",
         )
+        # Rescan project index after planning files are written
+        self._index.rescan()
         return True
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _main_loop(self):
-        """Itère sur toutes les phases, sprints et slices jusqu'à DONE."""
         phase_num = self.state.phase
 
         while True:
@@ -244,9 +265,17 @@ class Runner:
             self._check_stop_requested()
             self.state.slice_index = sl.index
             self.state.save()
-            # Initialiser l'historique d'exécution pour cette slice
-            self._exec_history = ExecutionHistory(slice_id=sl.id)
+            # Charger ou créer l'historique persistant pour cette slice
+            self._exec_history = ExecutionHistory.load_or_new(
+                slice_id=sl.id, project_dir=self.project_dir
+            )
+            # Rescan partiel de l'index (pour refléter les fichiers de la slice
+            # précédente) ; léger, ignore les contenus inchangés via SHA1.
+            self._index.rescan()
             self._process_slice(sl, phase_file)
+            # Reset compteur rescue pour la slice suivante
+            if self._rescue_counter.slice_id != sl.id:
+                self._rescue_counter.reset(self.project_dir)
 
     # ── Traitement d'une slice ────────────────────────────────────────────────
 
@@ -291,13 +320,23 @@ class Runner:
                 phase_file.update_slice_status(sl.id, "IN_PROGRESS", iterations)
 
             else:
+                # Mode rescue Architecte — avec cap !
+                rescue_n = self._rescue_counter.increment(sl.id, self.project_dir)
+                escalate, esc_msg = should_escalate_human(rescue_n)
+                if escalate:
+                    self.log.warning(f"🚨  {esc_msg}")
+                    self._handle_rescue_overflow(sl, tester_notes, phase_file)
+                    return
+
                 self.log.info(
-                    f"🏗️  Escalade Architecte pour '{sl.name}' (>{MAX_ITERATIONS} itérations)"
+                    f"🏗️  Escalade Architecte pour '{sl.name}' "
+                    f"(rescue {rescue_n}/{MAX_RESCUES_BEFORE_HUMAN})"
                 )
                 self.state.current_role = "ARCHITECT"
                 self.state.save()
 
-                arch_prompt = self._build_architect_rescue_prompt(sl, tester_notes)
+                arch_prompt = self._build_architect_rescue_prompt(sl, tester_notes,
+                                                                   rescue_n)
                 self._call_agent("ARCHITECT", arch_prompt, history=self._exec_history)
                 duration_arch = time.time() - t0
 
@@ -313,13 +352,29 @@ class Runner:
 
             t1 = time.time()
             tester_prompt = self._build_tester_prompt(sl)
+            commands_before = len(self._exec_history.commands) if self._exec_history else 0
             tester_response = self._call_agent(
                 "TESTER", tester_prompt, history=self._exec_history
             )
+            commands_after = len(self._exec_history.commands) if self._exec_history else 0
+            tester_commands_run = commands_after - commands_before
             duration_tester = time.time() - t1
 
             verdict = self._extract_verdict(tester_response)
             tester_notes = self._extract_tester_notes(tester_response)
+
+            # Anti rubber-stamp : Tester PASS sans aucune commande après plusieurs iter
+            rubber, rubber_msg = is_rubber_stamp(verdict, tester_commands_run, iterations)
+            if rubber:
+                self.log.warning(f"🚨  {rubber_msg}")
+                verdict = "FAIL"
+                tester_notes = (
+                    "[Rubber stamp détecté par anti-drift] "
+                    "Le Tester a renvoyé PASS sans exécuter de commande de "
+                    "vérification. Le verdict est retraité en FAIL. "
+                    "Note originale : " + (tester_notes or "(vide)")
+                )
+
             self.state.last_verdict = verdict
             self.state.iterations = iterations
             self.state.save()
@@ -336,8 +391,11 @@ class Runner:
                 hlog.log_slice_end(sl.name, "PASS", iterations, total_duration)
                 self.telegram.notify_pass(sl.phase, sl.sprint, sl.name)
                 self._auto_commit(sl)
+                # Reset rescue counter — slice résolue
+                self._rescue_counter.reset(self.project_dir)
                 self.state.iterations = 0
                 self.state.save()
+                self._index.rescan()
                 return
 
             if verdict == "BLOCKED":
@@ -363,15 +421,33 @@ class Runner:
             if iterations >= MAX_ITERATIONS:
                 self.log.info(f"⚠️  {MAX_ITERATIONS} itérations atteintes pour '{sl.name}'")
 
+    # ── Rescue overflow (cap atteint) ─────────────────────────────────────────
+
+    def _handle_rescue_overflow(self, sl: Slice, notes: str, phase_file: PhaseFile):
+        """Quand MAX_RESCUES_BEFORE_HUMAN est atteint sans débloquer la slice."""
+        question = (
+            f"La slice '{sl.name}' (phase {sl.phase}, sprint {sl.sprint}) ne se "
+            f"débloque pas après {MAX_RESCUES_BEFORE_HUMAN} rescues Architecte. "
+            "Dernier verdict Tester : FAIL. Notes : "
+            f"{notes[:300] if notes else '(aucune)'}. "
+            "Que faire ? Reformuler la slice / changer de stack / passer outre ?"
+        )
+        phase_file.update_slice_status(sl.id, "BLOCKED",
+                                        sl.iterations + MAX_RESCUES_BEFORE_HUMAN,
+                                        f"[ESCALADE HUMAINE] {notes}")
+        self._notify_human_needed(question, context=f"Rescue overflow sur {sl.name}")
+        self._wait_human_input()
+
     # ── Revues ────────────────────────────────────────────────────────────────
 
     def _sprint_review(self, phase: int, sprint: int):
         self.log.info(f"🔍  Revue Sprint {sprint} (Phase {phase})…")
         prompt = SPRINT_REVIEW_PROMPT.format(phase=phase, sprint=sprint)
-        self._call_agent("ARCHITECT", prompt)
+        history = ExecutionHistory(slice_id=f"review-P{phase}-S{sprint}",
+                                    project_dir=self.project_dir)
+        self._call_agent("ARCHITECT", prompt, history=history)
 
     def _phase_review(self, phase: int):
-        """Vérifie que toutes les slices sont PASS puis appelle l'Architecte."""
         self.log.info(f"🔍  Revue Phase {phase}…")
 
         phase_file_check = PhaseFile(phase, self.project_dir)
@@ -390,7 +466,9 @@ class Runner:
 
         next_exists = PhaseFile(phase + 1, self.project_dir).path.exists()
         prompt = PHASE_REVIEW_PROMPT.format(phase=phase)
-        response = self._call_agent("ARCHITECT", prompt)
+        history = ExecutionHistory(slice_id=f"review-P{phase}",
+                                    project_dir=self.project_dir)
+        response = self._call_agent("ARCHITECT", prompt, history=history)
 
         if "NEXT: DONE" in response:
             if next_exists:
@@ -428,7 +506,6 @@ class Runner:
         prompt: str,
         history: ExecutionHistory | None = None,
     ) -> str:
-        """Appelle un agent, gère le heartbeat et le stop."""
         import threading
         import time as _time
 
@@ -470,9 +547,7 @@ class Runner:
         finally:
             _stop_evt.set()
 
-        # Vérifier le stop après chaque appel (pas seulement entre slices)
         self._check_stop_requested()
-
         self._debug_pause(role, response)
         return response
 
@@ -519,7 +594,6 @@ class Runner:
     # ── Inject prompt Architecte ──────────────────────────────────────────────
 
     def _inject_architect_prompt_if_pending(self):
-        """Si .haufcode/architect_prompt.txt existe, l'envoie à l'Architecte."""
         from haufcode.daemon import DEBUG_PROMPT_MARKER
 
         prompt_file = Path(self.project_dir) / DEBUG_PROMPT_MARKER
@@ -541,7 +615,9 @@ class Runner:
             "N'invente JAMAIS les résultats des commandes — Python les exécute réellement. "
             "Termine par NEXT: BUILDER ou NEXT: ARCHITECT selon la suite."
         )
-        self._call_agent("ARCHITECT", arch_prompt)
+        history = ExecutionHistory(slice_id="user-message",
+                                    project_dir=self.project_dir)
+        self._call_agent("ARCHITECT", arch_prompt, history=history)
 
     # ── Notifications humaines ────────────────────────────────────────────────
 
@@ -571,11 +647,13 @@ class Runner:
     ) -> str:
         arch_md = self._read_file("ARCHITECTURE.md")
         history_ctx = self._exec_history.to_context() if self._exec_history else ""
+        tree = self._index.to_tree(max_entries=60)
 
         prompt = (
             f"# Tâche Builder — Itération {iteration}\n\n"
             f"## Slice à implémenter\n{sl.raw_block}\n\n"
-            f"## Architecture du projet\n{arch_md}\n"
+            f"## Architecture du projet\n{arch_md}\n\n"
+            f"## Structure actuelle du projet\n```\n{tree}\n```\n"
         )
         if history_ctx:
             prompt += f"\n{history_ctx}\n"
@@ -584,123 +662,61 @@ class Runner:
         prompt += (
             "\n## Instructions\n"
             "Implémente le code pour satisfaire les critères d'acceptation. "
-            "Vérifie que tout fonctionne avant de terminer."
+            "Utilise READ_FILE pour consulter les fichiers existants au lieu de "
+            "supposer leur contenu. Vérifie que tout fonctionne (RUN: …) avant "
+            "de terminer. Termine par TASK_COMPLETE ou NEXT: TESTER."
         )
         return prompt
 
     def _build_tester_prompt(self, sl: Slice) -> str:
-        phase_md = self._read_file(f"PHASE{sl.phase}.md")
-        code_context = self._collect_project_files(sl)
         history_ctx = self._exec_history.to_context() if self._exec_history else ""
+        tree = self._index.to_tree(max_entries=60)
 
+        # On n'injecte plus 60K de code source brut — le Tester appellera
+        # READ_FILE sur ce qui l'intéresse.
         prompt = (
             f"# Tâche Tester\n\n"
             f"## Slice à vérifier\n{sl.raw_block}\n\n"
+            f"## Structure actuelle du projet\n```\n{tree}\n```\n"
+            "Utilise READ_FILE pour inspecter les fichiers spécifiques mentionnés "
+            "dans la slice ou ARCHITECTURE.md. Ne te base PAS sur des suppositions.\n\n"
         )
         if history_ctx:
             prompt += f"{history_ctx}\n\n"
         prompt += (
-            f"## Contexte de la phase\n{phase_md}\n\n"
-            f"## Code implémenté par le Builder\n{code_context}\n\n"
-            "Inspecte le code et rends ton verdict (PASS/FAIL/BLOCKED).\n"
-            "Les résultats d'exécution dans l'historique ont priorité sur l'analyse statique.\n"
-            "BLOCKED uniquement si évaluation structurellement impossible."
+            "## Instructions\n"
+            "1. READ_FILE: ARCHITECTURE.md (si pas déjà lu) pour le contexte.\n"
+            f"2. READ_FILE: PHASE{sl.phase}.md pour relire les critères.\n"
+            "3. READ_FILE des fichiers de code pertinents.\n"
+            "4. RUN: au moins une commande de vérification fonctionnelle.\n"
+            "5. Rends ton verdict (PASS/FAIL/BLOCKED).\n\n"
+            "BLOCKED = évaluation structurellement impossible. Pas un échec Builder.\n"
+            "PASS = tous les critères validés ET au moins UNE commande de vérif réussie."
         )
         return prompt
 
-    def _collect_project_files(self, sl: Slice) -> str:
-        import os
-        import re as _re
-
-        EXCLUDED_DIRS = {
-            "node_modules", ".git", ".haufcode", "__pycache__",
-            "dist", "build", ".next", "coverage", "logs",
-        }
-        INCLUDED_EXTENSIONS = {
-            ".js", ".ts", ".py", ".json", ".yaml", ".yml",
-            ".env.example", ".sql", ".sh", ".ejs", ".html",
-            ".css", ".md", ".txt", ".dockerfile", "",
-        }
-        IGNORED_FILES = {
-            "TODO.md", "ARCHITECTURE.md", "ARCHITECT_OUTPUT.md",
-            "package-lock.json", "yarn.lock",
-        }
-        MAX_TOTAL_CHARS = 60_000
-        MAX_FILE_CHARS = 10_000
-
-        proj = Path(self.project_dir)
-        slice_text = sl.raw_block or ""
-        mentioned = set(_re.findall(
-            r"[\w./\-]+\.(?:js|ts|py|ejs|html|css|json|sql|sh|md)", slice_text
-        ))
-
-        def _read_entry(filepath: Path):
-            try:
-                rel = str(filepath.relative_to(proj))
-                if filepath.name in IGNORED_FILES:
-                    return None, None
-                if rel.startswith("PHASE"):
-                    return None, None
-                text = filepath.read_text(encoding="utf-8", errors="replace")
-                if len(text) > MAX_FILE_CHARS:
-                    text = text[:MAX_FILE_CHARS] + "\n... [tronqué]"
-                return rel, f"### {rel}\n```\n{text}\n```\n"
-            except Exception:
-                return None, None
-
-        collected: list[str] = []
-        seen: set[str] = set()
-        total_chars = 0
-
-        # Passe 1 : fichiers mentionnés dans la slice
-        for root, dirs, files in os.walk(proj):
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
-            for filename in sorted(files):
-                filepath = Path(root) / filename
-                rel, entry = _read_entry(filepath)
-                if not entry or not rel or rel in seen:
-                    continue
-                if not any(m in rel or rel.endswith(m) for m in mentioned):
-                    continue
-                if total_chars + len(entry) <= MAX_TOTAL_CHARS:
-                    collected.append(entry)
-                    seen.add(rel)
-                    total_chars += len(entry)
-
-        # Passe 2 : reste des fichiers
-        for root, dirs, files in os.walk(proj):
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
-            for filename in sorted(files):
-                ext = Path(filename).suffix.lower()
-                if ext not in INCLUDED_EXTENSIONS and not filename.startswith("Dockerfile"):
-                    continue
-                filepath = Path(root) / filename
-                rel, entry = _read_entry(filepath)
-                if not entry or not rel or rel in seen:
-                    continue
-                if total_chars >= MAX_TOTAL_CHARS:
-                    collected.append(f"### [Limite atteinte — {total_chars} chars]")
-                    break
-                if total_chars + len(entry) <= MAX_TOTAL_CHARS:
-                    collected.append(entry)
-                    seen.add(rel)
-                    total_chars += len(entry)
-
-        return "\n".join(collected) if collected else "(Aucun fichier source trouvé)"
-
-    def _build_architect_rescue_prompt(self, sl: Slice, notes: str) -> str:
+    def _build_architect_rescue_prompt(self, sl: Slice, notes: str,
+                                        rescue_n: int = 1) -> str:
         history_ctx = self._exec_history.to_context() if self._exec_history else ""
+        tree = self._index.to_tree(max_entries=60)
+        remaining = MAX_RESCUES_BEFORE_HUMAN - rescue_n
+
         prompt = (
-            f"# Architecte — Prise en charge directe\n\n"
-            f"La slice suivante a échoué après {MAX_ITERATIONS} itérations :\n\n"
-            f"{sl.raw_block}\n\n"
+            f"# Architecte — Prise en charge directe (rescue {rescue_n}/"
+            f"{MAX_RESCUES_BEFORE_HUMAN})\n\n"
+            f"La slice suivante a échoué après {MAX_ITERATIONS} itérations Builder/Tester.\n"
+            f"Il te reste {remaining} tentative(s) avant escalade humaine.\n\n"
+            f"## Slice\n{sl.raw_block}\n\n"
+            f"## Structure du projet\n```\n{tree}\n```\n\n"
         )
         if history_ctx:
             prompt += f"{history_ctx}\n\n"
         prompt += (
             f"## Dernières remarques du Tester\n{notes}\n\n"
             "Analyse le problème et implémente directement la solution. "
-            "N'invente JAMAIS les résultats des commandes — Python les exécute réellement."
+            "Si tu détectes que la slice est mal formulée ou nécessite un choix "
+            "humain, ouvre HUMAN_INPUT_NEEDED: ... — ne tourne pas en rond. "
+            "N'invente JAMAIS les résultats des commandes."
         )
         return prompt
 
@@ -720,18 +736,18 @@ class Runner:
             return path.read_text(encoding="utf-8")
         return f"({filename} non disponible)"
 
-    # ── Extraction de verdicts ────────────────────────────────────────────────
+    # ── Extraction de verdicts (déléguée à anti_drift) ────────────────────────
 
     @staticmethod
     def _extract_verdict(response: str) -> str:
-        match = re.search(r"VERDICT\s*:\s*(PASS|FAIL|BLOCKED)", response, re.IGNORECASE)
-        return match.group(1).upper() if match else "FAIL"
+        return _ad_extract_verdict(response, default="FAIL")
 
     @staticmethod
     def _extract_tester_notes(response: str) -> str:
-        match = re.search(r"Notes Tester\s*:\s*(.*)", response, re.DOTALL | re.IGNORECASE)
+        match = re.search(r"Notes\s+Tester\s*:\s*(.*?)(?=\n\s*(?:VERDICT|NEXT)\s*:|\Z)",
+                          response, re.DOTALL | re.IGNORECASE)
         if match:
-            return match.group(1).strip()[:500]
+            return match.group(1).strip()[:600]
         return ""
 
     @staticmethod

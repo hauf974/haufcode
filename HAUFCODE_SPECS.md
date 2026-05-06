@@ -1,8 +1,12 @@
 # HaufCode — Cahier des spécifications techniques
 
-> Version : 0.4.x — Mai 2026  
+> Version : 0.5.0 — Mai 2026  
 > Repo : `hauf974/haufcode`  
 > Langage : Python 3.11+ (Debian/Ubuntu)
+>
+> ⚠️ **v0.5 — refactor majeur.** Pour la liste détaillée des changements et
+> leur motivation (basée sur l'analyse d'un échec terrain documenté), voir
+> [`CHANGES_v0.5.md`](./CHANGES_v0.5.md).
 
 ---
 
@@ -89,23 +93,26 @@ HaufCode est une **usine à code automatisée, agnostique au modèle IA**. Elle 
 
 ```
 haufcode/
-├── __init__.py          — Version
+├── __init__.py          — Version (0.5.0)
 ├── __main__.py          — Entrée CLI, routage des commandes
 ├── agents.py            — Façade AgentClient (délègue à tool_caller)
+├── anti_drift.py        — (v0.5) Cap rescue, rubber stamp, extraction verdict
+├── browser_tester.py    — (v0.5) Tests Playwright headless (optionnel)
 ├── config.py            — GlobalConfig, ProjectConfig, ProjectState
 ├── daemon.py            — Gestion démon, PID, commandes start/stop/resume/status
-├── executor.py          — Exécution shell et écriture fichiers, annotations
+├── executor.py          — Exécution shell (bash) + read/list/patch/delete + annotations
 ├── git_ops.py           — Commits et push GitHub automatiques
 ├── logger.py            — Logger par session, log_prompt/response/slice
 ├── metrics.py           — Écriture CSV des métriques
 ├── onboarding.py        — Procédure d'installation interactive
-├── planning.py          — Parse/écriture PHASEx.md, TODO.md
+├── planning.py          — Parse/écriture PHASEx.md, TODO.md (regex tolérante)
+├── project_index.py     — (v0.5) Index incrémental du projet
 ├── project_setup.py     — Configuration interactive des agents et GitHub
-├── prompts.py           — Prompts système pour chaque rôle (2 variantes)
-├── runner.py            — Boucle principale Phase→Sprint→Slice
+├── prompts.py           — Prompts système (2 variantes par rôle, anti-patterns)
+├── runner.py            — Boucle principale + anti-drift + index
 ├── telegram_client.py   — Client HTTP Telegram (envoi/réception)
 ├── telegram_listener.py — Listener Telegram long-polling (processus séparé)
-└── tool_caller.py       — AgentExecutor (tool_call + text_parse), detect_tool_calls
+└── tool_caller.py       — AgentExecutor multi-actions, detect_tool_calls fiabilisé
 ```
 
 ---
@@ -258,80 +265,101 @@ Le statut `WAITING` signifie que l'usine peut reprendre avec `haufcode resume`. 
 
 #### Mode `TOOL_CALL` (function calling natif)
 
-Disponible pour les modèles qui le supportent (Mistral Large, GPT-4, Claude, Gemini, etc.).
+Disponible pour les modèles qui le supportent (Mistral Large/Medium/Small/devstral, GPT-4/5, Claude, Gemini, DeepSeek, Qwen 2.5+, Llama 3.x, Grok, Cohere…).
 
 Le modèle produit des **tool calls JSON structurés** — il ne peut pas inventer les résultats car Python les injecte après exécution réelle.
 
-Tools disponibles :
+Tools disponibles (v0.5 — 7 outils) :
 
-| Tool | Description |
-|---|---|
-| `write_file(path, content)` | Écrit un fichier dans le projet (contenu complet) |
-| `run_command(command)` | Exécute UNE commande shell, retourne exit_code + stdout + stderr |
-| `task_complete(next_role, summary)` | Signale la fin de la tâche |
+| Tool | Description | Disponible pour |
+|---|---|---|
+| `write_file(path, content)` | Écrit/écrase un fichier (contenu complet) | Architect, Builder |
+| `read_file(path, max_lines?)` | Lit un fichier — retourne contenu + métadonnées | Tous |
+| `list_files(path?, pattern?)` | Liste l'arborescence (récursif, filtré) | Tous |
+| `apply_patch(path, old_text, new_text)` | Modifie un bloc précis (échec si ambigu) | Architect, Builder |
+| `delete_file(path)` | Supprime un fichier (refusé pour `PHASE*.md`) | Architect, Builder |
+| `run_command(command)` | Exécute UNE commande dans `bash -lc` | Tous |
+| `task_complete(next_role, summary, verdict?)` | Signale la fin (verdict pour le Tester) | Tous |
+
+Le **Tester** dispose d'un sous-ensemble (`TESTER_TOOLS`) sans `write_file`/`apply_patch`/`delete_file` — il ne modifie JAMAIS le code.
+
+**Multi-tool calls par tour** : le modèle peut appeler plusieurs tools dans la même réponse. Python les exécute dans l'ordre et injecte tous les résultats avant le prochain tour.
 
 Boucle :
 ```
-1. Appel API avec tools=TOOLS
-2. Si le modèle produit des tool_calls → Python exécute chaque tool
+1. Appel API avec tools=TOOLS (ou TESTER_TOOLS)
+2. Si le modèle produit des tool_calls → Python exécute chaque tool dans l'ordre
 3. Résultats injectés dans le contexte → retour au modèle
 4. Si task_complete → fin de la boucle
-5. Max 10 tours (MAX_TURNS)
+5. Max 12 tours (MAX_TURNS)
 ```
 
-#### Mode `TEXT_PARSE` (parsing texte strict)
+#### Mode `TEXT_PARSE` (parsing texte robuste)
 
-Pour les modèles sans function calling (certains modèles Ollama, etc.).
+Pour les modèles sans function calling (certains modèles Ollama, Llama 2, etc.).
 
-**Une seule action par réponse** — Python parse, exécute, retourne le résultat, redemande.
+**v0.5 : multi-actions par réponse**. Le modèle peut enchaîner WRITE_FILE + RUN + TASK_COMPLETE dans la même réponse — Python parse toutes les actions, les exécute dans l'ordre, et fait remonter feedback + erreurs avant le prochain tour.
 
-Formats reconnus (par ordre de priorité) :
+Format des actions (extraits dans l'ordre par `_parse_all_actions`) :
 
 ```
-# Format standard (recommandé)
-WRITE_FILE: chemin/relatif/fichier.ext
+WRITE_FILE: chemin/relatif.ext
 ```
 contenu complet
 ```
 
+APPLY_PATCH: chemin/relatif.ext
+```old
+texte exact à remplacer (doit être unique)
+```
+```new
+texte de remplacement
+```
+
+READ_FILE: chemin/relatif.ext
+LIST_FILES src/
+DELETE_FILE: chemin/relatif.ext
+
 RUN: commande shell
 
 TASK_COMPLETE
-
-# Format alternatif Mistral
-WRITE_FILE:
-   Path: ./fichier.ext
-   Content: |
-     contenu
-
-# Commandes dans blocs bash (première ligne non-commentaire exécutée)
-```bash
-# commentaire ignoré
-commande_exécutée
-```
+ou
+NEXT: TESTER | BUILDER | ARCHITECT | HUMAN | DONE
 ```
 
-Feedback si erreur :
+**Le parser tolère les fences imbriquées** (cas Mistral wrapped) :
+
 ```
-⚠️ ERREUR DÉTECTÉE. Tu DOIS corriger cette erreur avant de continuer.
+```yaml                       ← fence wrapper (parser le détecte par parité)
+WRITE_FILE: package.json
+```                           ← fermeture du wrapper
+```json                       ← VRAI fence du contenu
+{...}
+```
 ```
 
-Feedback si succès :
-```
-Action suivante (UNE SEULE), ou TASK_COMPLETE si tout est terminé et vérifié :
-```
+Ce cas faisait écrire des fichiers vides en v0.4 ; il est désormais correctement parsé. Le parser détermine si une ligne d'action est dans un fence ouvert via comptage des triples-backticks (pair = hors fence, impair = dedans).
 
 ### Détection du support function calling
 
-Au moment de `changeagents` ou `start`, `detect_tool_call_support()` envoie un appel minimal avec un tool `ping` et vérifie si la réponse contient des `tool_calls`. Le résultat est stocké dans `.haufcode/config.json` comme `supports_tool_calls: true/false`.
+Stratégie en 3 étapes (`detect_tool_call_support`) :
 
-### ExecutionHistory
+1. **Whitelist** : si `model` matche un pattern connu (regex sur `mistralai/`, `deepseek/`, `qwen/qwen-2.5+`, `openai/gpt-4|5`, `anthropic/claude`, `google/gemini`, `meta-llama/llama-3.[123]`, `x-ai/grok`, `cohere/command-r`), retourne `True` directement.
+2. **Test API réel** (en fallback) : envoie un appel avec un tool `echo_word(word)` et un système prompt explicite « tu DOIS appeler le tool ». Vérifie si la réponse contient `tool_calls`.
+3. Échec → `False`.
 
-`ExecutionHistory` est un objet accumulatif créé pour chaque slice et transmis entre les itérations Builder→Tester. Il contient :
-- `files_written` : liste des fichiers écrits pendant la slice
-- `commands` : historique des 6 dernières commandes avec exit_code, stdout, stderr, annotations
+Cette détection corrige le faux négatif v0.4 où Mistral répondait « pong » en texte par politesse.
 
-Il est injecté en début de prompt pour que le Builder ne répète pas les mêmes erreurs et que le Tester voie les vrais résultats d'exécution.
+### ExecutionHistory (persistante)
+
+`ExecutionHistory` est un objet accumulatif créé pour chaque slice et **persisté sur disque** dans `.haufcode/history/<slice_id>.json` à chaque ajout. Il contient :
+- `files_written` / `files_read` / `files_deleted` : listes des chemins touchés
+- `commands` : historique des commandes (toutes — les 6 dernières sont injectées dans le contexte)
+
+Méthodes clés :
+- `ExecutionHistory.load_or_new(slice_id, project_dir)` : charge le JSON ou crée un objet vide. **Le runner appelle ceci au début de chaque slice** — ainsi un resume reprend l'historique exact.
+- `is_repeating_failure(n=3)` : retourne `True` si les `n` dernières commandes échouées sont identiques. Détecte les boucles.
+- `to_context()` : rend l'historique sous forme de bloc markdown injectable dans les prompts.
 
 ---
 
@@ -341,16 +369,42 @@ Ce module est **indépendant de toute logique IA**. Il reçoit des instructions 
 
 ### `run_command(command, project_dir) → CommandResult`
 
-- Exécute dans `project_dir` avec timeout de 120s.
+- Exécute via **`bash -lc`** (v0.5 — au lieu de `shell=True` qui invoquait dash).
+  Cela rétablit la brace expansion : `mkdir -p public/{css,js,assets}` crée bien 3 dossiers séparés.
+- Timeout 180s (relevé de 120s pour npm install).
 - Capture `exit_code`, `stdout`, `stderr`.
 - Appelle `_annotate()` pour enrichir le résultat.
-- Bloque les commandes dangereuses (`rm -rf /`, fork bomb, etc.).
+- Bloque les commandes dangereuses (`rm -rf /`, fork bomb, `mkfs`, `dd of=/dev/`, `shutdown`, etc.).
 
 ### `write_file(path, content, project_dir) → WriteResult`
 
-- Refuse les chemins hors du répertoire projet (sécurité).
+- Refuse les chemins hors du répertoire projet (sécurité, via `relative_to`).
+- Refuse les écritures dans `.git/`, `node_modules/`, `__pycache__/`, `.venv/`.
 - Crée les répertoires parents si nécessaire.
 - Écrase le fichier existant.
+
+### `read_file_safe(path, project_dir, max_lines=500) → ReadResult` *(v0.5)*
+
+Lit un fichier texte, retourne contenu + `total_lines` + flag `truncated` si limite atteinte. Refuse les chemins hors projet, les dossiers, les fichiers inexistants.
+
+### `list_files(project_dir, subpath='.', pattern=None, max_entries=500) → ListResult` *(v0.5)*
+
+Parcours récursif, exclut `.git`, `node_modules`, `.haufcode`, `dist`, `build`, `__pycache__`, `.venv`, etc. Retourne une liste de `(path, "file"|"dir")`. Pattern optionnel en glob.
+
+### `apply_patch(path, old_text, new_text, project_dir) → PatchResult` *(v0.5)*
+
+Remplace `old_text` par `new_text` dans le fichier. Échoue si :
+- `old_text` n'apparaît pas (`matches=0`)
+- `old_text` apparaît plusieurs fois (`matches>1`, ambigu)
+
+Le message d'erreur est actionnable (« élargis old_text pour le rendre unique »).
+
+### `delete_file(path, project_dir) → DeleteResult` *(v0.5)*
+
+Supprime un fichier. Refuse :
+- les chemins hors projet
+- les dossiers
+- les fichiers de planification critiques (`PROJET.md`, `PHASE*.md`)
 
 ### Annotations intelligentes (`_annotate`)
 
@@ -358,12 +412,19 @@ Python interprète les résultats et ajoute des annotations contextuelles. Le mo
 
 | Condition détectée | Annotation ajoutée | Effet sur exit_code |
 |---|---|---|
-| `docker ps` montre `restarting` | "Container en restarting — ce n'est PAS sain" | Forcé à 1 |
-| `docker ps` montre `exited` | "Container crashé — voir docker compose logs" | Forcé à 1 |
-| `ERR_DLOPEN_FAILED` ou `symbol not found` | "Module natif incompatible Alpine/Debian" | Inchangé |
-| `Cannot find module` | "npm install manquant" | Inchangé |
-| `EADDRINUSE` | "Port déjà utilisé" | Inchangé |
-| Tests échoués | "Analyse les FAIL et corrige" | Inchangé |
+| `docker compose` montre `restarting` | « Container en restarting — pas sain » | Forcé à 1 |
+| `docker compose` montre `Exited (≠0)` | « Container crashé — voir logs » | Forcé à 1 |
+| `EADDRINUSE` | Extrait le port, propose `pkill -f` / `fuser -k` | Inchangé |
+| `ERR_DLOPEN_FAILED` / `symbol not found` | « Module natif Alpine vs Debian » | Inchangé |
+| `Cannot find module 'X'` | « npm install manquant — module : X » | Inchangé |
+| `ERESOLVE` / peer dep conflict | « `npm install --legacy-peer-deps` » | Inchangé |
+| Python `Traceback` | Extrait le dernier `XxxError: ...` | Inchangé |
+| Vite/webpack `syntax error` | « Vérifie balises JSX, accolades » | Inchangé |
+| `curl` réussi mais stdout vide | « Réponse vide — vérifie le serveur » | Inchangé |
+| Brace expansion non interprétée *(rétrocompat)* | « Préfère `mkdir -p a b c` » | Inchangé |
+| `No space left on device` | « Disque plein — `docker system prune -f` » | Inchangé |
+| Tests échoués (jest/vitest/pytest) | « Analyse les FAIL et corrige » | Inchangé |
+| Timeout (>180s) | « Lance en background avec ` &` » | -1 |
 
 **Point critique** : `docker compose ps` retourne exit_code=0 même si un container est en `restarting`. Sans annotation, le modèle conclurait que tout va bien. L'annotation force exit_code=1 et oblige le modèle à diagnostiquer.
 
@@ -373,23 +434,25 @@ Python interprète les résultats et ajoute des annotations contextuelles. Le mo
 
 ### Formats de slice supportés
 
-HaufCode supporte deux formats d'identifiant de slice, produits par différents modèles :
+HaufCode supporte plusieurs formats d'identifiant et de profondeur d'en-tête (v0.5 — tolérance accrue) :
 
 | Format | Exemple | Interprétation |
 |---|---|---|
-| Standard | `S1-2`, `S3-3a` | Phase 1, index 2 (sprint=index) |
-| Mistral | `1.1-2`, `1.2-3` | Phase 1, sprint 1, index 2 |
+| Standard | `S1-2`, `S3-3a` | Phase 1, sprint 1 (par défaut), index 2 |
+| Mistral/devstral | `1.1-2`, `1.2-3` | Phase 1, sprint 1, index 2 |
+| Avec ou sans le mot « Slice » | `### Slice 1.1-1`, `## S1-1` | Identique |
+| Profondeur d'en-tête | `##`, `###`, `####` | Toutes acceptées |
 
-La regex `SLICE_HEADER` :
+La regex `SLICE_HEADER` (v0.5) :
 ```python
-r"^#{2,3}\s+(?:Slice\s+)?(S?[\d]+[.-][\w.-]+)\s*:?\s*(.+)$"
+r"^#{2,4}\s+(?:Slice\s+)?(S?[\d]+[.-][\w.-]+)\s*:?\s*(.+)$"
 ```
 
-Accepte `## Slice S1-1 : Nom`, `### Slice 1.1-1 : Nom`, `## S2-3a : Nom`.
+Accepte `## Slice S1-1 : Nom`, `### Slice 1.1-1 : Nom`, `#### S2-3a : Nom`, `## 1.1-1 Nom`.
 
-Le `re.split` qui découpe le fichier en blocs :
+Le `re.split` qui découpe le fichier en blocs accepte aussi `#{2,4}` :
 ```python
-r"(?=^#{2,3}\s+(?:Slice\s+)?S?[\d]+[.-])"
+r"(?=^#{2,4}\s+(?:Slice\s+)?S?[\d]+[.-])"
 ```
 
 ### Format attendu d'une slice dans PHASEx.md
@@ -406,7 +469,11 @@ r"(?=^#{2,3}\s+(?:Slice\s+)?S?[\d]+[.-])"
 
 ### `update_slice_status(slice_id, status, iterations, tester_notes)`
 
-Met à jour en place le fichier PHASEx.md via regex. Ne réécrit pas tout le fichier — cible uniquement les champs `Statut`, `Itérations`, `Notes Tester` de la slice concernée.
+Met à jour en place le fichier PHASEx.md via regex tolérante (`#{2,4}`). Cible uniquement les champs `Statut`, `Itérations`, `Notes Tester` de la slice concernée.
+
+### Diagnostic en cas de PHASE.md mal formée
+
+`diagnose_phase_file(phase_num, project_dir)` produit un rapport texte expliquant pourquoi aucune slice n'a pu être parsée — quels blocs ont été détectés, quel format est attendu. Affiché dans les logs lors d'une `AutoInterruption`.
 
 ### Fallback `write_architect_output`
 
@@ -641,17 +708,59 @@ Sauvegarde de la dernière réponse brute de l'Architecte. Utile pour déboguer.
 ### Résistance aux hallucinations
 
 1. **Mode tool_call** : le modèle ne peut physiquement pas inventer les résultats — Python les injecte.
-2. **Mode text_parse** : une action à la fois. Si le modèle produit du texte sans action reconnue, la boucle se termine (réponse finale). Si le modèle produit une action, Python exécute et retourne le résultat réel.
-3. **Annotations intelligentes** : des états "faussement OK" (ex: container en `restarting`) sont détectés et signalés explicitement avec `exit_code=1` forcé.
+2. **Mode text_parse** : `_parse_all_actions` extrait toutes les actions de la réponse et les exécute dans l'ordre. Les retours sont accumulés et renvoyés au modèle.
+3. **Annotations intelligentes** : des états « faussement OK » (ex: container en `restarting`) sont détectés et signalés explicitement avec `exit_code=1` forcé.
 4. **Prompts d'honnêteté** : tous les prompts incluent les règles `_HONESTY_RULES` qui interdisent d'inventer les résultats de commandes.
+5. **Anti-patterns explicites** : chaque prompt système liste les pièges réels (Mistral wrapped, fichiers `read_xxx.md` avec `cat` dedans, `ARCHITECTURE_v2.md`, etc.) avec consignes précises pour les éviter.
+
+### Anti-drift (v0.5) — module `anti_drift.py`
+
+Trois détecteurs comportementaux empêchent l'usine de tourner en rond :
+
+#### Cap rescue + escalade humaine
+
+`RescueCounter` (persistant dans `.haufcode/rescue_state.json`) compte les rescues consécutifs Architecte sur la slice courante. Constante `MAX_RESCUES_BEFORE_HUMAN = 3`. Au-delà, le runner appelle `_handle_rescue_overflow` qui :
+1. Marque la slice comme `BLOCKED` avec une note `[ESCALADE HUMAINE]`
+2. Notifie l'humain via Telegram avec contexte (notes Tester + question de reformulation)
+3. Met l'usine en `WAITING`
+
+Le compteur est **remis à zéro** dès qu'une slice atteint PASS, ou explicitement quand on change de slice.
+
+#### Détection « rubber stamp »
+
+`is_rubber_stamp(verdict, tester_commands_run, iteration)` : retourne `True` si :
+- `verdict == "PASS"`
+- `tester_commands_run < MIN_TESTER_COMMANDS_FOR_PASS` (défaut 1)
+- `iteration >= RUBBER_STAMP_AFTER_N_ITERATIONS` (défaut 4)
+
+Cas typique : après plusieurs tours difficiles, le Tester valide la slice sans avoir exécuté la moindre commande de vérification — juste pour débloquer le pipeline. Le runner détecte ça, force `verdict = FAIL` et ajoute une note explicite. La slice repasse au Builder.
+
+#### Détection de boucles d'échecs identiques
+
+`ExecutionHistory.is_repeating_failure(n=3)` : retourne `True` si les `n` dernières commandes échouées sont identiques au caractère près. Exposée dans le contexte du Builder/Architecte pour signaler qu'on tourne en rond.
+
+#### Extraction de verdict robuste
+
+`anti_drift.extract_verdict(response)` accepte les variantes : `VERDICT: PASS`, `**Verdict** : FAIL`, `Verdict révisé: BLOCKED`, `Verdict final: PASS`. Si plusieurs verdicts sont mentionnés (cas de délibération), le **dernier** l'emporte.
+
+### Index de projet (v0.5) — module `project_index.py`
+
+`ProjectIndex` (cache dans `.haufcode/index.json`) remplace l'ancien dump 60K caractères de `_collect_project_files`. Stocké : `path`, `size`, `sha1[:12]`, `lang` détecté, `mtime`. Méthodes principales :
+
+- `to_tree(max_entries=60)` : arborescence compacte (~1–3 KB) injectée dans les prompts.
+- `to_summary()` : résumé court (« 12 fichiers, 8.2 kB total. Langages: js:7, css:3, md:2 »).
+- `find(pattern)` : substring search dans les paths.
+- `diff_against(prev)` : retourne `{added, removed, changed}` entre deux snapshots.
+
+Le runner `rescan()` à chaque fin de slice (incrémental — sha1 inchangé = pas re-lu).
 
 ### Reprise après interruption
 
-L'état dans `state.json` contient exactement phase+sprint+slice_index+rôle courant. `haufcode resume` repart exactement là où le démon s'est arrêté. Les slices PASS ne sont jamais re-traitées.
+L'état dans `state.json` contient phase+sprint+slice_index+rôle courant. **L'`ExecutionHistory` de la slice est aussi persistée** dans `.haufcode/history/<slice_id>.json` à chaque ajout (v0.5) — la reprise reprend exactement avec l'historique des commandes/fichiers déjà touchés. `haufcode resume` repart exactement là où le démon s'est arrêté. Les slices PASS ne sont jamais re-traitées.
 
 ### Phase vide = erreur bloquante
 
-Si `PHASEx.md` existe mais ne contient aucune slice parseable, c'est une `AutoInterruption` immédiate. La phase vide ne passe jamais pour "terminée".
+Si `PHASEx.md` existe mais ne contient aucune slice parseable, c'est une `AutoInterruption` immédiate. Le diagnostic produit par `diagnose_phase_file` est joint au message d'erreur.
 
 ### Révision de phase avec garde-fou
 
@@ -663,6 +772,22 @@ Même si l'Architecte répond `NEXT: DONE`, si `PHASE{N+1}.md` existe sur le dis
 
 Si le Builder retourne moins de 100 caractères, c'est considéré comme une réponse tronquée (timeout, quota, etc.). La slice est remise en `IN_PROGRESS` et le Builder est rappelé sans passer au Tester.
 
+### Tests fonctionnels frontend (v0.5, optionnel) — `browser_tester.py`
+
+Module Playwright headless **scaffoldé mais non activé par défaut**. Pour activer :
+```bash
+pip install playwright
+playwright install chromium
+```
+
+Fonctions principales :
+- `smoke_test(url, expected_selectors=[...], screenshot_path=...)` — charge la page, vérifie sélecteurs, capture erreurs console/network, prend un screenshot.
+- `click_and_check(url, click_selector, expected_after_click=[...])` — interaction basique.
+
+Si Playwright n'est pas installé, les fonctions retournent un `BrowserTestResult` BLOCKED avec un hint d'installation — pas de crash.
+
+Le Tester peut intégrer ces appels manuellement dans son workflow pour les projets web. Une intégration automatique (détection « projet web » → smoke_test obligatoire) est prévue pour une itération future.
+
 ---
 
 ## 16. Modules — référence rapide
@@ -670,14 +795,17 @@ Si le Builder retourne moins de 100 caractères, c'est considéré comme une ré
 | Module | Rôle | Dépendances clés |
 |---|---|---|
 | `__main__.py` | Routage CLI | `daemon`, `onboarding` |
-| `runner.py` | Boucle Phase→Sprint→Slice | `agents`, `planning`, `prompts`, `tool_caller` |
+| `runner.py` | Boucle Phase→Sprint→Slice + anti-drift + index | `agents`, `planning`, `prompts`, `tool_caller`, `project_index`, `anti_drift` |
 | `agents.py` | Façade AgentClient | `tool_caller` |
-| `tool_caller.py` | Boucle agentique, 2 modes | `executor` |
-| `executor.py` | Shell + fichiers + annotations | `subprocess`, `pathlib` |
-| `planning.py` | Parse/update PHASEx.md | `re`, `pathlib` |
+| `tool_caller.py` | Boucle agentique, 2 modes, 7 tools, parser robuste | `executor` |
+| `executor.py` | bash + fichiers + annotations + read/list/patch/delete | `subprocess`, `pathlib` |
+| `planning.py` | Parse/update PHASEx.md (`#{2,4}` tolérante) | `re`, `pathlib` |
+| `project_index.py` *(v0.5)* | Index incrémental projet (sha1, tree, diff) | `os`, `hashlib` |
+| `anti_drift.py` *(v0.5)* | Cap rescue, rubber stamp, extraction verdict | `re`, `dataclasses` |
+| `browser_tester.py` *(v0.5, optionnel)* | Tests Playwright headless | `playwright` (si installé) |
 | `config.py` | GlobalConfig, ProjectConfig, ProjectState | `json`, `pathlib` |
 | `daemon.py` | Démon, PID, commandes CLI | `config`, `runner` |
-| `prompts.py` | Prompts système (2 variantes par rôle) | — |
+| `prompts.py` | Prompts système (2 variantes par rôle, anti-patterns) | — |
 | `onboarding.py` | Installation interactive | `config`, `telegram_client` |
 | `project_setup.py` | Config agents + GitHub | `config`, `tool_caller` |
 | `telegram_client.py` | HTTP Telegram send/receive | `urllib` |
