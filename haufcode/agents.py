@@ -19,10 +19,11 @@ class AgentClient:
     selon la configuration de l'agent.
     """
 
-    def __init__(self, agent_cfg: dict):
+    def __init__(self, agent_cfg: dict, role: str | None = None):
         self.cfg = agent_cfg
         self.provider = agent_cfg.get("provider", "")
         self.model = agent_cfg.get("model", "")
+        self.role = role  # ARCHITECT | BUILDER | TESTER (utilisé pour brider write_file)
 
     def call(
         self,
@@ -34,12 +35,15 @@ class AgentClient:
     ) -> str:
         """
         Envoie un prompt à l'agent et retourne la réponse texte finale.
-        Les actions WRITE_FILE/RUN sont exécutées par Python de façon transparente.
+        Les actions WRITE_FILE/READ_FILE/LIST_FILES/RUN sont exécutées par Python
+        de façon transparente.
         """
         if self.provider == "claude_code_cli":
             return self._call_claude_code_cli(prompt, system)
 
-        executor = AgentExecutor(self.cfg, project_dir, history)
+        executor = AgentExecutor(
+            self.cfg, project_dir, history, role=self.role,
+        )
         return executor.run(prompt, system, max_tokens)
 
     def _call_claude_code_cli(self, prompt: str, system: str) -> str:
@@ -80,4 +84,4 @@ def get_agent(role: str, project_cfg) -> AgentClient:
             f"Aucun agent configuré pour le rôle '{role}'. "
             "Lancez 'haufcode changeagents' pour configurer."
         )
-    return AgentClient(cfg)
+    return AgentClient(cfg, role=role)
