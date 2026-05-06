@@ -18,16 +18,6 @@ from pathlib import Path
 import haufcode.git_ops as git_ops
 from haufcode import logger as hlog
 from haufcode.agents import AgentClient, get_agent
-from haufcode.config import GlobalConfig, ProjectConfig, ProjectState
-from haufcode.metrics import record as record_metric
-from haufcode.planning import PhaseFile, Slice
-from haufcode.prompts import (
-    ARCHITECT_INIT_PROMPT,
-    PHASE_REVIEW_PROMPT,
-    SPRINT_REVIEW_PROMPT,
-    get_system_prompt,
-)
-from haufcode.telegram_client import TelegramClient
 from haufcode.anti_drift import (
     MAX_RESCUES_BEFORE_HUMAN,
     RescueCounter,
@@ -35,7 +25,17 @@ from haufcode.anti_drift import (
     is_rubber_stamp,
     should_escalate_human,
 )
+from haufcode.config import GlobalConfig, ProjectConfig, ProjectState
+from haufcode.metrics import record as record_metric
+from haufcode.planning import PhaseFile, Slice
 from haufcode.project_index import ProjectIndex
+from haufcode.prompts import (
+    ARCHITECT_INIT_PROMPT,
+    PHASE_REVIEW_PROMPT,
+    SPRINT_REVIEW_PROMPT,
+    get_system_prompt,
+)
+from haufcode.telegram_client import TelegramClient
 from haufcode.tool_caller import ExecutionHistory
 
 MAX_ITERATIONS = 5  # Itérations Builder→Tester avant escalade à l'Architecte

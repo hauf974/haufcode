@@ -28,11 +28,11 @@ from pathlib import Path
 
 from haufcode.executor import (
     CommandResult,
-    WriteResult,
-    ReadResult,
-    ListResult,
     DeleteResult,
+    ListResult,
     PatchResult,
+    ReadResult,
+    WriteResult,
     apply_patch,
     delete_file,
     list_files,
