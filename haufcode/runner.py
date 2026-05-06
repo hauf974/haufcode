@@ -28,15 +28,15 @@ from haufcode.prompts import (
     get_system_prompt,
 )
 from haufcode.telegram_client import TelegramClient
-from haufcode.tool_caller import ExecutionHistory
-from haufcode.project_index import ProjectIndex
 from haufcode.anti_drift import (
+    MAX_RESCUES_BEFORE_HUMAN,
     RescueCounter,
     extract_verdict as _ad_extract_verdict,
     is_rubber_stamp,
     should_escalate_human,
-    MAX_RESCUES_BEFORE_HUMAN,
 )
+from haufcode.project_index import ProjectIndex
+from haufcode.tool_caller import ExecutionHistory
 
 MAX_ITERATIONS = 5  # Itérations Builder→Tester avant escalade à l'Architecte
 

@@ -23,7 +23,7 @@ import os
 import re
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from haufcode.executor import (
@@ -393,7 +393,7 @@ class AgentExecutor:
         self.base_url_cfg = agent_cfg.get("base_url", "")
         self.supports_tools = agent_cfg.get("supports_tool_calls", False)
         self.project_dir = project_dir
-        self.role = role.upper()
+        self.role = (role or "").upper()
         self.history = history or ExecutionHistory(slice_id="adhoc",
                                                     project_dir=project_dir)
 

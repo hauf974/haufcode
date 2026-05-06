@@ -20,7 +20,7 @@ import hashlib
 import json
 import os
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 EXCLUDE_DIRS = {
@@ -123,8 +123,10 @@ class ProjectIndex:
     @staticmethod
     def _detect_lang(filename: str) -> str:
         n = filename.lower()
-        if n in ("dockerfile",) or n.endswith(".dockerfile"): return "dockerfile"
-        if n == "makefile":                                    return "makefile"
+        if n in ("dockerfile",) or n.endswith(".dockerfile"):
+            return "dockerfile"
+        if n == "makefile":
+            return "makefile"
         ext = Path(filename).suffix.lower()
         return {
             ".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "jsx",
@@ -195,7 +197,7 @@ class ProjectIndex:
         from collections import Counter
         langs = Counter(f.lang for f in self.files if f.lang)
         total_kb = sum(f.size for f in self.files) / 1024
-        top_langs = ", ".join(f"{l}:{n}" for l, n in langs.most_common(5))
+        top_langs = ", ".join(f"{lang}:{cnt}" for lang, cnt in langs.most_common(5))
         return (f"📊 {len(self.files)} fichiers, {total_kb:.1f} kB total. "
                 f"Langages: {top_langs or 'inconnus'}.")
 

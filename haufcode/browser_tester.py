@@ -101,6 +101,7 @@ def smoke_test(
         return result
 
     import time
+
     from playwright.sync_api import sync_playwright
 
     t0 = time.time()
@@ -185,6 +186,7 @@ def click_and_check(
         return result
 
     import time
+
     from playwright.sync_api import sync_playwright
 
     expected_after_click = expected_after_click or []
