@@ -21,7 +21,7 @@ from haufcode.agents import AgentClient, get_agent
 from haufcode.anti_drift import (
     MAX_RESCUES_BEFORE_HUMAN,
     RescueCounter,
-    extract_verdict as _ad_extract_verdict,
+    extract_verdict,
     is_rubber_stamp,
     should_escalate_human,
 )
@@ -37,6 +37,8 @@ from haufcode.prompts import (
 )
 from haufcode.telegram_client import TelegramClient
 from haufcode.tool_caller import ExecutionHistory
+
+_ad_extract_verdict = extract_verdict
 
 MAX_ITERATIONS = 5  # Itérations Builder→Tester avant escalade à l'Architecte
 
